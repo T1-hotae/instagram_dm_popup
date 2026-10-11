@@ -1,0 +1,41 @@
+{
+  "name": "insta-dm",
+  "version": "1.0.0",
+  "description": "카카오톡처럼 쓰는 Instagram DM 데스크톱 앱 (우측 하단 알림)",
+  "author": "InstaDM",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "test-popup": "electron . --hidden --test-popup",
+    "icon": "powershell -ExecutionPolicy Bypass -File scripts/make-icon.ps1",
+    "dist": "electron-builder --win nsis",
+    "dist:portable": "electron-builder --win portable"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "local.insta-dm",
+    "productName": "InstaDM",
+    "files": ["src/**/*", "assets/**/*"],
+    "directories": { "output": "dist" },
+    "win": {
+      "icon": "assets/icon.png",
+      "target": "nsis"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "InstaDM",
+      "runAfterFinish": true,
+      "deleteAppDataOnUninstall": false,
+      "installerLanguages": ["ko_KR"],
+      "language": "1042",
+      "artifactName": "InstaDM-Setup-${version}.${ext}"
+    }
+  }
+}
