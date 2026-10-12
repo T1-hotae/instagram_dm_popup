@@ -1,5 +1,5 @@
 const {
-  app, BrowserWindow, Tray, Menu, ipcMain, screen, shell, nativeImage, session,
+  app, BrowserWindow, Tray, Menu, ipcMain, screen, shell, nativeImage, session, dialog,
 } = require('electron');
 const path = require('path');
 const fs = require('fs');
@@ -37,6 +37,50 @@ function saveSettings() {
     fs.writeFileSync(settingsPath(), JSON.stringify(settings, null, 2));
   } catch (e) {
     console.error('settings save failed', e);
+  }
+}
+
+/* ---------------- 로그 (메시지 내용은 기록하지 않음) ---------------- */
+
+const logPath = () => path.join(app.getPath('userData'), 'insta-dm.log');
+
+function log(...parts) {
+  const line = `[${new Date().toLocaleString('ko-KR')}] ${parts.map((p) => (typeof p === 'string' ? p : JSON.stringify(p))).join(' ')}\n`;
+  try {
+    const file = logPath();
+    if (fs.existsSync(file) && fs.statSync(file).size > 300 * 1024) {
+      const keep = fs.readFileSync(file, 'utf8').slice(-150 * 1024);
+      fs.writeFileSync(file, keep);
+    }
+    fs.appendFileSync(file, line);
+  } catch {
+    // 로그 실패는 무시
+  }
+}
+
+/* ---------------- 프로필 사진 ---------------- */
+
+// 팝업이 Instagram 이미지 서버에서 직접 받으면 막힐 수 있어서, 로그인 세션으로 먼저 받아 data URL로 넘긴다.
+const avatarCache = new Map();
+
+async function resolveAvatar(url) {
+  if (!/^https:\/\//.test(url || '')) return '';
+  if (avatarCache.has(url)) return avatarCache.get(url);
+  try {
+    const ses = session.fromPartition('persist:instagram');
+    const res = await Promise.race([
+      ses.fetch(url, { headers: { Referer: 'https://www.instagram.com/' } }),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 4000)),
+    ]);
+    const type = res.headers.get('content-type') || '';
+    if (!res.ok || !type.startsWith('image/')) throw new Error(`HTTP ${res.status} ${type}`);
+    const data = `data:${type};base64,${Buffer.from(await res.arrayBuffer()).toString('base64')}`;
+    if (avatarCache.size > 100) avatarCache.delete(avatarCache.keys().next().value);
+    avatarCache.set(url, data);
+    return data;
+  } catch (e) {
+    log('avatar 실패', e.message);
+    return '';
   }
 }
 
@@ -140,8 +184,38 @@ function createWatcherWindow() {
   // 메모리 누수 방지를 위해 3시간마다 새로고침
   setInterval(() => watcherWindow && !watcherWindow.isDestroyed() && watcherWindow.loadURL(INBOX_URL), 3 * 60 * 60 * 1000);
 
-  watcherWindow.on('close', (e) => { if (!quitting) e.preventDefault(); });
+  watcherWindow.on('close', (e) => {
+    if (!quitting) {
+      e.preventDefault();
+      watcherWindow.hide();
+      refreshMenus();
+    }
+  });
+  watcherWindow.webContents.on('did-navigate', (_e, url) => log('감시 창 이동', new URL(url).pathname));
 }
+
+// 알림 경로 점검: 데이터 요청·화면 읽기·프로필 사진을 각각 확인해서 결과만 보여 준다
+ipcMain.on('watcher:selftest-result', async (_e, r) => {
+  const avatarOk = r.api && r.api.samplePic ? !!(await resolveAvatar(r.api.samplePic)) : false;
+  const ox = (v) => (v ? '○' : '×');
+  const lines = [
+    `감시 창 위치: ${r.path}${r.path.startsWith('/direct') ? '' : '  ← 받은편지함이 아님 (로그인 필요?)'}`,
+    '',
+    `[1순위] 받은편지함 데이터: ${r.api.ok ? '성공' : `실패 (${r.api.error})`}`,
+    ...(r.api.ok ? [
+      `   대화 ${r.api.threads}개 · 내용 ${ox(r.api.hasText)} · 이름 ${ox(r.api.hasName)} · 프로필 사진 ${ox(avatarOk)}`,
+    ] : []),
+    `[2순위] 화면 목록 읽기: 대화 줄 ${r.dom.rows}개 (미리보기 있는 줄 ${r.dom.withPreview}개)`,
+    '',
+    r.api.ok
+      ? '새 DM이 오면 이름·내용·프로필 사진이 팝업에 나옵니다.'
+      : r.dom.withPreview
+        ? '데이터 요청은 실패했지만 화면 읽기로 이름·내용을 알릴 수 있습니다.'
+        : '두 방법 모두 실패했습니다. "감시 창 보기"로 화면을 확인해 주세요.',
+  ];
+  log('점검', { path: r.path, api: { ...r.api, samplePic: !!(r.api && r.api.samplePic) }, dom: r.dom, avatarOk });
+  dialog.showMessageBox({ type: 'info', title: 'InstaDM 알림 경로 점검', message: '알림 경로 점검 결과', detail: lines.join('\n') });
+});
 
 // 메인 창에서 로그인하면 감시 창도 로그인 상태로 다시 연다
 function reloadWatcherSoon() {
@@ -282,17 +356,33 @@ ipcMain.on('popup:close', (e) => {
 
 /* ---------------- 페이지 → 메인 ---------------- */
 
-ipcMain.on('dm:notify', (_e, n) => {
+ipcMain.on('dm:notify', async (_e, n) => {
   lastNotifyAt = Date.now();
+  log('알림', { source: n.source || 'page', hasBody: !!n.body, hasIcon: !!n.icon });
+  const icon = await resolveAvatar(n.icon);
   showPopup({
     id: Number(n.id) || 0,
     title: String(n.title || 'Instagram').slice(0, 100),
     body: String(n.body || '').slice(0, 300),
-    icon: /^https:\/\//.test(n.icon || '') ? n.icon : '',
+    icon,
     tag: String(n.tag || ''),
     url: isInstagram(n.url || '') ? n.url : '',
   });
   flashIfHidden();
+});
+
+// 감시 창 상태 기록 (메시지 내용 없음)
+let apiOkAt = 0;
+let lastApiStatus = '';
+ipcMain.on('watcher:status', (_e, s) => {
+  if (s.source === 'api') {
+    if (s.ok) apiOkAt = Date.now();
+    // 같은 상태가 반복되면 기록하지 않음
+    const key = JSON.stringify({ ok: s.ok, threads: s.threads, httpStatus: s.httpStatus, error: s.error });
+    if (key === lastApiStatus && s.reason === 'interval') return;
+    lastApiStatus = key;
+  }
+  log('감시', s);
 });
 
 ipcMain.on('dm:unread', (_e, count) => {
@@ -302,10 +392,13 @@ ipcMain.on('dm:unread', (_e, count) => {
 
   if (unread > prev) {
     flashIfHidden();
-    // 페이지가 알림을 직접 보내지 않은 경우(백그라운드 등)를 위한 대체 팝업
+    log('읽지 않음 증가', prev, '→', unread);
+    // 받은편지함 데이터를 바로 확인해서 이름·내용을 가져온다
+    if (watcherWindow && !watcherWindow.isDestroyed()) watcherWindow.webContents.send('watcher:check');
+    // 데이터 확인이 안 될 때만 요약 팝업 (데이터가 잘 되는데 새 DM이 없으면 좋아요 등 다른 알림이므로 띄우지 않음)
     clearTimeout(fallbackTimer);
     fallbackTimer = setTimeout(() => {
-      if (Date.now() - lastNotifyAt > 8000) {
+      if (Date.now() - lastNotifyAt > 8000 && Date.now() - apiOkAt > 3 * 60 * 1000) {
         showPopup({
           id: 0,
           title: 'Instagram',
@@ -390,6 +483,22 @@ function menuTemplate() {
         if (watcherWindow) watcherWindow.loadURL(INBOX_URL);
       },
     },
+    { type: 'separator' },
+    {
+      label: '알림 경로 점검',
+      click: () => watcherWindow && watcherWindow.webContents.send('watcher:selftest'),
+    },
+    {
+      label: '감시 창 보기',
+      type: 'checkbox',
+      checked: !!(watcherWindow && !watcherWindow.isDestroyed() && watcherWindow.isVisible()),
+      click: (item) => {
+        if (!watcherWindow) return;
+        if (item.checked) watcherWindow.show();
+        else watcherWindow.hide();
+      },
+    },
+    { label: '로그 파일 열기', click: () => shell.openPath(logPath()) },
     {
       label: '문제 진단 파일 저장',
       click: () => watcherWindow && watcherWindow.webContents.send('watcher:dump'),
@@ -422,6 +531,7 @@ app.on('second-instance', () => showMain());
 app.whenReady().then(() => {
   app.setAppUserModelId('local.insta-dm');
   loadSettings();
+  log('시작', app.getVersion());
 
   // Instagram 웹이 알림 권한을 받을 수 있게 허용
   const ses = session.fromPartition('persist:instagram');
