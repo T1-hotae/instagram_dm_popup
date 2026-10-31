@@ -1,5 +1,5 @@
 const {
-  app, BrowserWindow, Tray, Menu, ipcMain, screen, shell, nativeImage, session, dialog,
+  app, BrowserWindow, WebContentsView, Tray, Menu, ipcMain, screen, shell, nativeImage, nativeTheme, session, dialog,
 } = require('electron');
 const path = require('path');
 const fs = require('fs');
@@ -86,12 +86,21 @@ async function resolveAvatar(url) {
 
 /* ---------------- 메인 창 ---------------- */
 
+// 창은 테두리 없이 만들고 위쪽 36px에 직접 그린 타이틀바(titlebar.html)를,
+// 그 아래에 Instagram 화면(igView)을 붙인다.
+const TITLEBAR_H = 36;
+
 let mainWindow = null;
+let igView = null;
 let tray = null;
 let quitting = false;
-let unread = 0;
-let lastNotifyAt = 0;
-let fallbackTimer = null;
+let unread = 0; // 탭 제목 (N) 숫자 (좋아요 등 다른 알림이 섞임)
+let apiUnread = null; // 받은편지함 데이터로 센 읽지 않은 대화 수 (DM만)
+let apiOkAt = 0;
+let pageTheme = ''; // Instagram 화면이 다크/라이트 중 무엇인지
+let avatarClickAt = 0;
+
+const apiHealthy = () => Date.now() - apiOkAt < 3 * 60 * 1000;
 
 function createMainWindow() {
   mainWindow = new BrowserWindow({
@@ -102,8 +111,18 @@ function createMainWindow() {
     title: 'InstaDM',
     icon: path.join(ASSETS, 'icon.png'),
     show: false,
-    autoHideMenuBar: false,
-    backgroundColor: '#ffffff',
+    frame: false,
+    backgroundColor: nativeTheme.shouldUseDarkColors ? '#000000' : '#ffffff',
+    webPreferences: {
+      preload: path.join(__dirname, 'titlebar-preload.js'),
+      contextIsolation: true,
+      sandbox: true,
+      nodeIntegration: false,
+    },
+  });
+  mainWindow.loadFile(path.join(__dirname, 'titlebar.html'));
+
+  igView = new WebContentsView({
     webPreferences: {
       partition: 'persist:instagram', // 로그인 유지
       preload: path.join(__dirname, 'preload.js'),
@@ -113,11 +132,22 @@ function createMainWindow() {
       spellcheck: false,
     },
   });
+  mainWindow.contentView.addChildView(igView);
+  const layoutView = () => {
+    const [width, height] = mainWindow.getContentSize();
+    igView.setBounds({ x: 0, y: TITLEBAR_H, width, height: Math.max(0, height - TITLEBAR_H) });
+  };
+  layoutView();
+  mainWindow.on('resize', layoutView);
 
-  mainWindow.loadURL(INBOX_URL);
+  const wc = igView.webContents;
+  wc.loadURL(INBOX_URL);
 
   mainWindow.once('ready-to-show', () => {
-    if (!START_HIDDEN) mainWindow.show();
+    if (!START_HIDDEN) {
+      mainWindow.show();
+      wc.focus();
+    }
   });
 
   // X 버튼은 종료가 아니라 트레이로 숨기기 (카카오톡과 동일)
@@ -128,34 +158,133 @@ function createMainWindow() {
     }
   });
 
-  mainWindow.on('focus', () => mainWindow.flashFrame(false));
+  mainWindow.on('focus', () => {
+    mainWindow.flashFrame(false);
+    sendTitlebarState();
+  });
+  ['blur', 'maximize', 'unmaximize'].forEach((ev) => mainWindow.on(ev, sendTitlebarState));
+  mainWindow.webContents.on('did-finish-load', sendTitlebarState);
 
   let lastMainUrl = '';
   const onMainNavigate = (_e, url) => {
     if (lastMainUrl.includes('/accounts/') && !url.includes('/accounts/')) reloadWatcherSoon();
     lastMainUrl = url;
+    const p = new URL(url).pathname;
+    if (p.startsWith('/accounts/') || p.startsWith('/challenge')) log('메인 이동', p);
+    // 받은편지함 사진 클릭을 막지 못해 스토리가 열렸으면 되돌린다
+    if (p.startsWith('/stories/') && Date.now() - avatarClickAt < 1500) {
+      avatarClickAt = 0;
+      if (wc.navigationHistory.canGoBack()) wc.navigationHistory.goBack();
+    }
+    syncTheme();
   };
-  mainWindow.webContents.on('did-navigate', onMainNavigate);
-  mainWindow.webContents.on('did-navigate-in-page', onMainNavigate);
+  wc.on('did-navigate', onMainNavigate);
+  wc.on('did-navigate-in-page', onMainNavigate);
+  wc.on('did-finish-load', syncTheme);
 
-  // 새 창 요청: Instagram 안의 링크는 메인 창에서, 외부 링크는 기본 브라우저로
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (isInstagram(url)) mainWindow.loadURL(url);
+  // 새 창 요청: 페이스북·Meta 로그인은 앱 안 작은 창에서 (같은 세션이라 로그인이 반영됨),
+  // Instagram 안의 링크는 메인 창에서, 외부 링크는 기본 브라우저로
+  wc.setWindowOpenHandler(({ url }) => {
+    if (isMetaLogin(url)) {
+      return {
+        action: 'allow',
+        overrideBrowserWindowOptions: {
+          parent: mainWindow,
+          width: 520,
+          height: 720,
+          autoHideMenuBar: true,
+          title: '로그인',
+          webPreferences: { partition: 'persist:instagram', contextIsolation: true, sandbox: true },
+        },
+      };
+    }
+    if (isInstagram(url)) wc.loadURL(url);
     else if (/^https?:/.test(url)) shell.openExternal(url);
     return { action: 'deny' };
   });
 
-  mainWindow.webContents.on('will-navigate', (e, url) => {
+  wc.on('will-navigate', (e, url) => {
     if (!isInstagram(url) && !isMetaLogin(url)) {
       e.preventDefault();
       if (/^https?:/.test(url)) shell.openExternal(url);
     }
   });
+
+  // 메뉴바가 없어서 단축키를 직접 처리
+  wc.on('before-input-event', (e, input) => {
+    if (input.type !== 'keyDown' || !input.control) return;
+    const key = input.key.toLowerCase();
+    if (key === 'r') wc.reload();
+    else if (key === '=' || key === '+') zoom(0.5);
+    else if (key === '-') zoom(-0.5);
+    else if (key === '0') zoom(0);
+    else if (key === 'i' && input.shift) wc.openDevTools({ mode: 'detach' });
+    else return;
+    e.preventDefault();
+  });
+
+  setInterval(() => mainWindow.isVisible() && syncTheme(), 5000);
 }
+
+function zoom(step) {
+  if (!igView) return;
+  const wc = igView.webContents;
+  wc.setZoomLevel(step ? wc.getZoomLevel() + step : 0);
+}
+
+// Instagram 화면 배경이 어두운지 보고 타이틀바 색을 맞춘다
+async function syncTheme() {
+  if (!igView) return;
+  try {
+    const dark = await igView.webContents.executeJavaScript(`(() => {
+      const cl = document.documentElement.classList;
+      if (cl.contains('__fb-dark-mode')) return true;
+      if (cl.contains('__fb-light-mode')) return false;
+      const m = getComputedStyle(document.body).backgroundColor.match(/[\\d.]+/g);
+      if (!m || (m.length > 3 && Number(m[3]) === 0)) return null;
+      return (Number(m[0]) + Number(m[1]) + Number(m[2])) / 3 < 128;
+    })()`);
+    const theme = dark === null ? '' : dark ? 'dark' : 'light';
+    if (theme !== pageTheme) {
+      pageTheme = theme;
+      if (theme) mainWindow.setBackgroundColor(theme === 'dark' ? '#000000' : '#ffffff');
+      sendTitlebarState();
+    }
+  } catch {
+    // 페이지가 아직 준비되지 않음
+  }
+}
+
+function sendTitlebarState() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send('titlebar:state', {
+    unread: badgeCount(),
+    maximized: mainWindow.isMaximized(),
+    focused: mainWindow.isFocused(),
+    theme: pageTheme,
+  });
+}
+
+ipcMain.on('titlebar:minimize', () => mainWindow && mainWindow.minimize());
+ipcMain.on('titlebar:maximize', () => {
+  if (!mainWindow) return;
+  if (mainWindow.isMaximized()) mainWindow.unmaximize();
+  else mainWindow.maximize();
+});
+ipcMain.on('titlebar:close', () => mainWindow && mainWindow.close());
+ipcMain.on('titlebar:menu', (_e, pos) => {
+  if (!mainWindow) return;
+  Menu.buildFromTemplate(menuTemplate()).popup({
+    window: mainWindow,
+    x: Math.round(Number(pos && pos.x) || 0),
+    y: Math.round(Number(pos && pos.y) || TITLEBAR_H),
+  });
+});
 
 // 화면에 보이지 않는 감시 창: 항상 DM 받은편지함을 띄워 두고 새 메시지 내용을 읽는다.
 // 가로 폭을 넓게 잡아야 대화 목록이 보이는 데스크톱 화면 구성이 나온다.
 let watcherWindow = null;
+let watcherRetryTimer = null;
 
 function createWatcherWindow() {
   watcherWindow = new BrowserWindow({
@@ -175,10 +304,14 @@ function createWatcherWindow() {
   watcherWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   watcherWindow.loadURL(INBOX_URL);
 
-  // 받은편지함을 벗어나면(로그인 화면 등) 잠시 뒤 다시 받은편지함으로
+  // 받은편지함을 벗어나면 잠시 뒤 다시 받은편지함으로.
+  // 로그인 화면이면 다시 불러오지 않고 메인 창 로그인이 끝나길 기다린다 (reloadWatcherSoon).
   watcherWindow.webContents.on('did-navigate', (_e, url) => {
-    if (!url.startsWith(INBOX_URL)) {
-      setTimeout(() => watcherWindow && !watcherWindow.isDestroyed() && watcherWindow.loadURL(INBOX_URL), 60000);
+    const p = new URL(url).pathname;
+    log('감시 창 이동', p);
+    clearTimeout(watcherRetryTimer);
+    if (!url.startsWith(INBOX_URL) && !p.startsWith('/accounts/') && !p.startsWith('/challenge')) {
+      watcherRetryTimer = setTimeout(() => watcherWindow && !watcherWindow.isDestroyed() && watcherWindow.loadURL(INBOX_URL), 60000);
     }
   });
   // 메모리 누수 방지를 위해 3시간마다 새로고침
@@ -191,7 +324,6 @@ function createWatcherWindow() {
       refreshMenus();
     }
   });
-  watcherWindow.webContents.on('did-navigate', (_e, url) => log('감시 창 이동', new URL(url).pathname));
 }
 
 // 알림 경로 점검: 데이터 요청·화면 읽기·프로필 사진을 각각 확인해서 결과만 보여 준다
@@ -219,7 +351,8 @@ ipcMain.on('watcher:selftest-result', async (_e, r) => {
 
 // 메인 창에서 로그인하면 감시 창도 로그인 상태로 다시 연다
 function reloadWatcherSoon() {
-  setTimeout(() => watcherWindow && !watcherWindow.isDestroyed() && watcherWindow.loadURL(INBOX_URL), 3000);
+  clearTimeout(watcherRetryTimer);
+  watcherRetryTimer = setTimeout(() => watcherWindow && !watcherWindow.isDestroyed() && watcherWindow.loadURL(INBOX_URL), 3000);
 }
 
 function isInstagram(url) {
@@ -231,11 +364,12 @@ function isInstagram(url) {
   }
 }
 
-// 페이스북 계정으로 로그인하는 흐름은 창 안에서 허용
+// 페이스북·Meta 계정 로그인과 2단계 인증 흐름은 창 안에서 허용
 function isMetaLogin(url) {
   try {
     const h = new URL(url).hostname;
-    return h.endsWith('facebook.com') || h.endsWith('accountscenter.instagram.com');
+    return h.endsWith('facebook.com') || h.endsWith('accountscenter.instagram.com')
+      || h === 'meta.com' || h.endsWith('.meta.com') || h.endsWith('fbcdn.net');
   } catch {
     return false;
   }
@@ -243,10 +377,11 @@ function isMetaLogin(url) {
 
 function showMain(url) {
   if (!mainWindow) return;
-  if (url && isInstagram(url)) mainWindow.loadURL(url);
+  if (url && isInstagram(url)) igView.webContents.loadURL(url);
   if (mainWindow.isMinimized()) mainWindow.restore();
   mainWindow.show();
   mainWindow.focus();
+  igView.webContents.focus();
 }
 
 /* ---------------- 우측 하단 팝업 알림 ---------------- */
@@ -338,9 +473,9 @@ ipcMain.on('popup:click', (e) => {
   const win = BrowserWindow.fromWebContents(e.sender);
   const p = popups.find((x) => x.win === win);
   if (p) {
-    if (p.data.id && mainWindow) {
+    if (p.data.id && igView) {
       // 페이지가 등록한 알림 onclick을 실행 → Instagram이 해당 대화로 이동
-      mainWindow.webContents.send('dm:click', p.data.id);
+      igView.webContents.send('dm:click', p.data.id);
       showMain();
     } else {
       showMain(p.data.url || INBOX_URL);
@@ -357,8 +492,14 @@ ipcMain.on('popup:close', (e) => {
 /* ---------------- 페이지 → 메인 ---------------- */
 
 ipcMain.on('dm:notify', async (_e, n) => {
-  lastNotifyAt = Date.now();
-  log('알림', { source: n.source || 'page', hasBody: !!n.body, hasIcon: !!n.icon });
+  const source = n.source || 'page';
+  // 페이지가 보내는 알림에는 좋아요 등 활동 알림이 섞이고, 받은편지함 데이터와 같은 DM을 겹쳐 알린다.
+  // 데이터 방식이 잘 되면 페이지 알림은 버리고, 안 될 때만 DM으로 보이는 것을 통과시킨다.
+  if (source === 'page' && (apiHealthy() || !/direct/.test(`${n.url || ''} ${n.tag || ''}`))) {
+    log('페이지 알림 무시', { apiHealthy: apiHealthy() });
+    return;
+  }
+  log('알림', { source, hasBody: !!n.body, hasIcon: !!n.icon });
   const icon = await resolveAvatar(n.icon);
   showPopup({
     id: Number(n.id) || 0,
@@ -371,8 +512,10 @@ ipcMain.on('dm:notify', async (_e, n) => {
   flashIfHidden();
 });
 
+// 받은편지함 사진 클릭을 가로챈 시각 (스토리가 열려 버리면 되돌리는 데 씀)
+ipcMain.on('dm:avatar-click', () => { avatarClickAt = Date.now(); });
+
 // 감시 창 상태 기록 (메시지 내용 없음)
-let apiOkAt = 0;
 let lastApiStatus = '';
 ipcMain.on('watcher:status', (_e, s) => {
   if (s.source === 'api') {
@@ -385,31 +528,27 @@ ipcMain.on('watcher:status', (_e, s) => {
   log('감시', s);
 });
 
-ipcMain.on('dm:unread', (_e, count) => {
-  const prev = unread;
-  unread = Math.max(0, Number(count) || 0);
+// 받은편지함 데이터로 센 읽지 않은 대화 수 (DM만)
+ipcMain.on('dm:unread-api', (_e, count) => {
+  apiUnread = Math.max(0, Number(count) || 0);
   updateBadge();
+});
 
-  if (unread > prev) {
-    flashIfHidden();
-    log('읽지 않음 증가', prev, '→', unread);
-    // 받은편지함 데이터를 바로 확인해서 이름·내용을 가져온다
+// 탭 제목은 새 메시지가 있으면 "(1) Instagram" ↔ "OO님이 메시지를 보냈습니다"처럼 깜빡여서
+// 숫자가 0과 1을 오간다. 줄어드는 쪽은 5초간 그대로일 때만 반영한다.
+// 숫자가 바뀌면 받은편지함 데이터를 바로 확인해 DM 알림과 배지를 맞춘다 (요약 팝업은 띄우지 않음).
+let unreadTimer = null;
+ipcMain.on('dm:unread', (_e, count) => {
+  clearTimeout(unreadTimer);
+  const n = Math.max(0, Number(count) || 0);
+  if (n === unread) return;
+  unreadTimer = setTimeout(() => {
+    const prev = unread;
+    unread = n;
+    if (unread > prev) log('읽지 않음 증가', prev, '→', unread);
+    updateBadge();
     if (watcherWindow && !watcherWindow.isDestroyed()) watcherWindow.webContents.send('watcher:check');
-    // 데이터 확인이 안 될 때만 요약 팝업 (데이터가 잘 되는데 새 DM이 없으면 좋아요 등 다른 알림이므로 띄우지 않음)
-    clearTimeout(fallbackTimer);
-    fallbackTimer = setTimeout(() => {
-      if (Date.now() - lastNotifyAt > 8000 && Date.now() - apiOkAt > 3 * 60 * 1000) {
-        showPopup({
-          id: 0,
-          title: 'Instagram',
-          body: `읽지 않은 메시지·알림이 ${unread}개 있어요.`,
-          icon: '',
-          tag: 'unread-summary',
-          url: INBOX_URL,
-        });
-      }
-    }, 6000);
-  }
+  }, n < unread ? 5000 : 1500);
 });
 
 // 대화 목록 구조(메시지 내용 없이 태그·글자 수만)를 파일로 저장
@@ -425,16 +564,23 @@ function flashIfHidden() {
 
 /* ---------------- 트레이 / 배지 ---------------- */
 
+// 데이터 방식이 잘 되면 DM만 센 숫자를 쓴다. 제목 숫자가 먼저 줄어들 수 있어(읽음) 둘 중 작은 값.
+function badgeCount() {
+  return apiUnread !== null && apiHealthy() ? Math.min(apiUnread, unread) : unread;
+}
+
 function updateBadge() {
   if (!tray) return;
-  tray.setToolTip(unread ? `InstaDM — 읽지 않음 ${unread}` : 'InstaDM');
+  const n = badgeCount();
+  tray.setToolTip(n ? `InstaDM — 읽지 않음 ${n}` : 'InstaDM');
   if (mainWindow) {
     mainWindow.setOverlayIcon(
-      unread ? nativeImage.createFromPath(path.join(ASSETS, 'badge.png')) : null,
-      unread ? `읽지 않음 ${unread}` : '',
+      n ? nativeImage.createFromPath(path.join(ASSETS, 'badge.png')) : null,
+      n ? `읽지 않음 ${n}` : '',
     );
-    mainWindow.setTitle(unread ? `(${unread}) InstaDM` : 'InstaDM');
+    mainWindow.setTitle(n ? `(${n}) InstaDM` : 'InstaDM');
   }
+  sendTitlebarState();
 }
 
 function menuTemplate() {
@@ -462,6 +608,14 @@ function menuTemplate() {
     },
     { type: 'separator' },
     {
+      label: '보기',
+      submenu: [
+        { label: '확대', accelerator: 'Ctrl+=', registerAccelerator: false, click: () => zoom(0.5) },
+        { label: '축소', accelerator: 'Ctrl+-', registerAccelerator: false, click: () => zoom(-0.5) },
+        { label: '원래 크기', accelerator: 'Ctrl+0', registerAccelerator: false, click: () => zoom(0) },
+      ],
+    },
+    {
       label: '알림 테스트',
       click: () => {
         const wasFocused = mainWindow && mainWindow.isFocused();
@@ -478,8 +632,10 @@ function menuTemplate() {
     },
     {
       label: '새로고침',
+      accelerator: 'Ctrl+R',
+      registerAccelerator: false,
       click: () => {
-        if (mainWindow) mainWindow.webContents.reload();
+        if (igView) igView.webContents.reload();
         if (watcherWindow) watcherWindow.loadURL(INBOX_URL);
       },
     },
@@ -508,13 +664,9 @@ function menuTemplate() {
   ];
 }
 
-// 트레이 우클릭 메뉴와 창 위 '설정' 메뉴를 같은 내용으로 유지
+// 트레이 우클릭 메뉴. 창에서는 타이틀바의 설정 버튼이 같은 메뉴를 띄운다 (menuTemplate을 매번 새로 만듦)
 function refreshMenus() {
   if (tray) tray.setContextMenu(Menu.buildFromTemplate(menuTemplate()));
-  Menu.setApplicationMenu(Menu.buildFromTemplate([
-    { label: '설정', submenu: menuTemplate() },
-    { label: '보기', submenu: [{ role: 'reload', label: '새로고침' }, { role: 'zoomIn', label: '확대' }, { role: 'zoomOut', label: '축소' }, { role: 'resetZoom', label: '원래 크기' }] },
-  ]));
 }
 
 function createTray() {
@@ -532,6 +684,7 @@ app.whenReady().then(() => {
   app.setAppUserModelId('local.insta-dm');
   loadSettings();
   log('시작', app.getVersion());
+  Menu.setApplicationMenu(null);
 
   // Instagram 웹이 알림 권한을 받을 수 있게 허용
   const ses = session.fromPartition('persist:instagram');
