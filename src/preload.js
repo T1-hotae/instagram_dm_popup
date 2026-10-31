@@ -8,6 +8,7 @@ let clickHandler = null;
 contextBridge.exposeInMainWorld('__instaDM', {
   notify: (n) => ipcRenderer.send('dm:notify', n),
   onClick: (cb) => { clickHandler = cb; },
+  avatarClick: () => ipcRenderer.send('dm:avatar-click'),
 });
 
 ipcRenderer.on('dm:click', (_e, id) => {
@@ -78,6 +79,64 @@ webFrame.executeJavaScript(`(() => {
             addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; } })
         : query(p);
   }
+
+  // 받은편지함 목록의 프로필 사진(스토리 링)을 누르면 스토리 대신 그 대화를 연다.
+  // 목록 한 줄 판정은 감시 창(watcher-preload.js rowCandidates)과 같은 기준.
+  const isRow = (n) => {
+    if (n.matches('a[href*="/direct/t/"]')) return true;
+    if (!n.matches('[role="button"], [role="listitem"], [role="link"]')) return false;
+    const r = n.getBoundingClientRect();
+    if (r.height < 44 || r.height > 120 || r.width < 150 || !n.querySelector('img')) return false;
+    return (n.innerText || '').split('\\n').filter((s) => s.trim()).length >= 2;
+  };
+  const rowOf = (el) => {
+    for (let n = el; n && n !== document.body; n = n.parentElement) if (isRow(n)) return n;
+    return null;
+  };
+  // 같은 왼쪽 위치·폭의 줄이 여러 개 있어야 목록 (대화방 위쪽 헤더는 제외)
+  const inList = (row) => {
+    const a = row.getBoundingClientRect();
+    return [...document.querySelectorAll('a[href*="/direct/t/"], [role="button"], [role="listitem"], [role="link"]')]
+      .filter((n) => {
+        if (n === row) return false;
+        const b = n.getBoundingClientRect();
+        return Math.abs(b.left - a.left) < 2 && Math.abs(b.width - a.width) < 2 && isRow(n);
+      }).length >= 2;
+  };
+  const isAvatar = (t) => {
+    if (t.closest('a[href*="/stories/"]')) return true;
+    if (t.tagName === 'IMG' || t.tagName === 'CANVAS') return true;
+    const box = t.closest('[role="button"], [role="link"], a');
+    if (!box || !box.querySelector('img, canvas')) return false;
+    const r = box.getBoundingClientRect();
+    return r.width <= 80 && r.height <= 80;
+  };
+  const avatarRow = (e) => {
+    if (!location.pathname.startsWith('/direct/') || !(e.target instanceof Element)) return null;
+    if (!isAvatar(e.target)) return null;
+    const row = rowOf(e.target);
+    return row && inList(row) ? row : null;
+  };
+  const openRow = (row) => {
+    const link = row.matches('a[href*="/direct/t/"]') ? row : row.querySelector('a[href*="/direct/t/"]');
+    if (link) return link.click();
+    // 링크가 없는 구조면 사진이 아닌 글자(이름)를 눌러 Instagram이 대화를 열게 한다
+    const name = [...row.querySelectorAll('span')]
+      .find((s) => s.childElementCount === 0 && s.textContent.trim() && !isAvatar(s));
+    (name || row).click();
+  };
+  const guard = (e) => {
+    const row = avatarRow(e);
+    if (!row) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    if (e.type === 'click') {
+      bridge.avatarClick();
+      openRow(row);
+    }
+  };
+  ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach((type) =>
+    window.addEventListener(type, guard, true));
 })();`);
 
 // 탭 제목 "(3) Instagram" → 읽지 않음 3

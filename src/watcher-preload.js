@@ -69,25 +69,54 @@ function describe(item) {
   return '새 메시지를 보냈습니다.';
 }
 
+// 시작할 때 읽은 메시지 중 가장 최근 시각 (서버 시각, 마이크로초).
+// 이보다 오래된 메시지는 예전 대화가 목록 위로 올라온 것이라 알리지 않는다.
+let seededAtUs = 0;
+
+function viewerIdOf(json, threads) {
+  const v = json.viewer || {};
+  const id = v.pk || v.pk_id || v.strong_id__ || v.id || (threads.find((t) => t.viewer_id) || {}).viewer_id;
+  return id ? String(id) : '';
+}
+
+const lastSeenOf = (t, viewerId) =>
+  Number((t.last_seen_at && t.last_seen_at[viewerId] && t.last_seen_at[viewerId].timestamp) || 0);
+
+// 마지막 메시지가 상대방 것이고 내가 아직 안 본 대화 수 (DM만 센 읽지 않음 숫자)
+function countUnread(threads, viewerId) {
+  return threads.filter((t) => {
+    const it = (t.items || [])[0];
+    if (!it || String(it.user_id) === viewerId) return false;
+    const lastSeen = lastSeenOf(t, viewerId);
+    return !!lastSeen && Number(it.timestamp) > lastSeen;
+  }).length;
+}
+
 // 받은편지함 데이터에서 아직 알리지 않은 상대방 메시지를 찾는다 (대화방마다 가장 최근 것만)
 function processInbox(json) {
-  const viewerId = String((json.viewer && (json.viewer.pk || json.viewer.pk_id || json.viewer.id)) || '');
   const threads = (json.inbox && json.inbox.threads) || [];
+  const viewerId = viewerIdOf(json, threads);
   const newest = new Map();
+  let maxTs = 0;
 
   for (const t of threads) {
-    const lastSeen = Number((t.last_seen_at && t.last_seen_at[viewerId] && t.last_seen_at[viewerId].timestamp) || 0);
+    const lastSeen = lastSeenOf(t, viewerId);
     for (const it of t.items || []) {
+      maxTs = Math.max(maxTs, Number(it.timestamp) || 0);
       if (!it.item_id || seenItems.has(it.item_id)) continue;
       seenItems.add(it.item_id);
       if (!apiSeeded) continue; // 처음 읽은 내용은 알리지 않음
+      if (!viewerId) continue; // 누가 나인지 모르면 읽음 여부를 판단할 수 없어 알리지 않음
       if (String(it.user_id) === viewerId) continue; // 내가 보낸 것
+      if (Number(it.timestamp) <= seededAtUs) continue; // 시작 전에 온 것 (예전 대화)
       if (lastSeen && Number(it.timestamp) <= lastSeen) continue; // 이미 읽은 것
       const prev = newest.get(t.thread_id);
       if (!prev || Number(it.timestamp) > Number(prev.it.timestamp)) newest.set(t.thread_id, { t, it });
     }
   }
+  if (!apiSeeded) seededAtUs = maxTs;
   apiSeeded = true;
+  if (viewerId) ipcRenderer.send('dm:unread-api', countUnread(threads, viewerId));
 
   [...newest.values()]
     .sort((a, b) => Number(a.it.timestamp) - Number(b.it.timestamp))
@@ -112,6 +141,7 @@ function processInbox(json) {
 
 async function checkInbox(reason) {
   const now = Date.now();
+  if (!location.pathname.startsWith('/direct')) return; // 로그인 화면 등에서는 요청하지 않음
   if (now < apiPausedUntil) return;
   if (now - lastApiAt < API_MIN_GAP_MS) return;
   lastApiAt = now;
@@ -138,10 +168,9 @@ ipcRenderer.on('watcher:check', () => scheduleCheck('unread', 500));
 
 /* ================= 2순위: 화면 목록 읽기 ================= */
 
-const seenRows = new Set();
+const notifiedRows = new Set(); // 읽지 않은 상태로 이미 알린 대화 (이름)
 let domSeeded = false;
 let lastCount = 0;
-let pendingCountRise = 0;
 
 const MINE = /^(나|회원님|You)\s*:/; // 내가 보낸 메시지
 const TIME_SUFFIX = /\s*[·•]\s*[^·•]{1,8}$/; // " · 1분" 같은 시간 표시
@@ -187,7 +216,6 @@ function scanDom() {
   const count = m ? parseInt(m[1], 10) : 0;
   if (count > lastCount) {
     scheduleCheck('title'); // 숫자가 오르면 받은편지함 데이터를 바로 확인
-    if (domSeeded) pendingCountRise = Date.now();
   }
   lastCount = count;
 
@@ -200,25 +228,20 @@ function scanDom() {
   }
   if (!rows.length) return;
 
+  // 대화마다 읽지 않은 동안 한 번만 알린다. 미리보기 글자는 "1분 → 2분"처럼 계속 바뀌어서 기준으로 쓰지 않는다.
+  // 읽음(굵은 글씨 아님)으로 바뀌면 다음 새 메시지 때 다시 알릴 수 있게 지운다.
   const fresh = [];
   for (const r of rows) {
-    const sig = r.name + '|' + r.preview;
-    if (!seenRows.has(sig)) {
-      seenRows.add(sig);
-      if (r.unread && !MINE.test(r.preview)) fresh.push(r);
+    if (!r.unread || MINE.test(r.preview)) notifiedRows.delete(r.name);
+    else if (!notifiedRows.has(r.name)) {
+      notifiedRows.add(r.name);
+      fresh.push(r);
     }
   }
-  if (!domSeeded) { domSeeded = true; return; }
-  if (apiHealthy()) { pendingCountRise = 0; return; } // 데이터 방식이 잘 되면 화면 읽기는 알리지 않음
+  if (!domSeeded) { domSeeded = true; return; } // 시작할 때 이미 있던 읽지 않음은 알리지 않음
+  if (apiHealthy()) return; // 데이터 방식이 잘 되면 화면 읽기는 알리지 않음
 
-  if (fresh.length) {
-    pendingCountRise = 0;
-    fresh.slice(0, 3).reverse().forEach(domNotify);
-  } else if (pendingCountRise && Date.now() - pendingCountRise > 2500) {
-    pendingCountRise = 0;
-    const top = rows[0];
-    if (top && !MINE.test(top.preview)) domNotify(top);
-  }
+  fresh.slice(0, 3).reverse().forEach(domNotify);
 }
 
 /* ================= 시작 ================= */
