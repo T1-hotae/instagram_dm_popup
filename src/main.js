@@ -143,6 +143,29 @@ function createMainWindow() {
   const wc = igView.webContents;
   wc.loadURL(INBOX_URL);
 
+  // 숨김→표시, 최소화→복원 뒤 igView가 흰 화면으로 남는 경우가 있어 다시 배치하고 다시 그린다
+  ['show', 'restore', 'maximize', 'unmaximize'].forEach((ev) => mainWindow.on(ev, () => {
+    layoutView();
+    wc.invalidate();
+    if (ev === 'show') {
+      const b = igView.getBounds();
+      log('메인 표시', `${b.x},${b.y} ${b.width}x${b.height}`);
+    }
+  }));
+
+  // 렌더러가 죽거나 불러오기에 실패하면 흰 화면이 되므로 다시 불러온다
+  wc.on('render-process-gone', (_e, d) => {
+    log('메인 렌더러 종료', d.reason, d.exitCode);
+    setTimeout(() => !wc.isDestroyed() && wc.reload(), 1000);
+  });
+  wc.on('unresponsive', () => log('메인 응답 없음'));
+  wc.on('responsive', () => log('메인 응답 회복'));
+  wc.on('did-fail-load', (_e, code, _desc, _url, isMainFrame) => {
+    if (!isMainFrame || code === -3) return; // -3: 이동 중 취소, 정상
+    log('메인 불러오기 실패', code);
+    setTimeout(() => !wc.isDestroyed() && wc.reload(), 30000); // 오프라인이면 계속 실패하므로 간격을 넉넉히
+  });
+
   mainWindow.once('ready-to-show', () => {
     if (!START_HIDDEN) {
       mainWindow.show();
