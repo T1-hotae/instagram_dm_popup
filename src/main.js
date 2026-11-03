@@ -13,6 +13,10 @@ app.userAgentFallback = app.userAgentFallback
   .replace(/\s?Electron\/\S+/, '')
   .replace(/\s?insta-dm\/\S+/i, '');
 
+// Windows 창 가림 계산이 숨김→표시 뒤에도 igView를 "안 보임"으로 남겨 두면 화면이 하얗거나
+// 대화방 메시지 목록(보일 때만 그리는 목록)이 비어 보인다. 가림 계산을 끈다.
+app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion');
+
 if (!app.requestSingleInstanceLock()) {
   app.quit();
   process.exit(0);
@@ -130,6 +134,7 @@ function createMainWindow() {
       sandbox: true,
       nodeIntegration: false,
       spellcheck: false,
+      backgroundThrottling: false, // 숨김·최소화 중 멈춘 타이머·그리기 때문에 메시지가 안 그려지는 것을 막는다
     },
   });
   mainWindow.contentView.addChildView(igView);
@@ -149,7 +154,8 @@ function createMainWindow() {
     wc.invalidate();
     if (ev === 'show') {
       const b = igView.getBounds();
-      log('메인 표시', `${b.x},${b.y} ${b.width}x${b.height}`);
+      wc.executeJavaScript('document.visibilityState').catch(() => '?')
+        .then((v) => log('메인 표시', `${b.x},${b.y} ${b.width}x${b.height}`, v));
     }
   }));
 
