@@ -168,13 +168,16 @@ ipcRenderer.on('watcher:check', () => scheduleCheck('unread', 500));
 
 /* ================= 2순위: 화면 목록 읽기 ================= */
 
-const notifiedRows = new Map(); // 대화 이름 → 마지막으로 알린 상태 ('typing' | 'msg|미리보기')
+const notifiedRows = new Map(); // 대화 이름 → 마지막으로 알린 메시지 미리보기
+const typingNow = new Set(); // 지금 입력 중인 대화
+const lastPreview = new Map(); // 대화 이름 → 입력 중이 아닐 때의 마지막 미리보기 (읽음 여부 무관)
 let domSeeded = false;
 let lastCount = 0;
 
 const MINE = /^(나|회원님|You)\s*:/; // 내가 보낸 메시지
 const TYPING = /입력\s*(하는\s*)?중|작성\s*(하는\s*)?중|typing/i; // 상대가 입력 중일 때 미리보기 자리에 뜨는 문구
-const TIME_SUFFIX = /\s*[·•]\s*[^·•]{1,8}$/; // " · 1분" 같은 시간 표시
+const ACTIVE = /활동|Active/i; // 읽은 대화 미리보기 자리의 "활동 중", "5분 전 활동"
+const TIME_SUFFIX =/\s*[·•]\s*[^·•]{1,8}$/; // " · 1분" 같은 시간 표시
 // 시간이 따로 줄에 붙어 " 1분", " 방금"으로 끝나는 경우. 미리보기로 상태를 비교하므로 매분 바뀌는 글자는 꼭 지운다.
 const TIME_TAIL = /\s+(방금|지금|\d+\s*(초|분|시간|일|주)(\s*전)?|now|\d+\s*[smhdw])$/i;
 
@@ -206,10 +209,11 @@ function parseRow(el) {
   return { name, preview, unread, icon: img && /^https:/.test(img.src) ? img.src : '', url: href || '' };
 }
 
-function domNotify(row) {
+// kind: 'typing' | 'typing-stop' | 'msg'. 같은 tag의 팝업은 main이 창을 그대로 두고 내용만 바꾼다.
+function domNotify(row, kind) {
   ipcRenderer.send('dm:notify', {
     id: 0, title: row.name, body: row.preview, icon: row.icon,
-    tag: 'dm:' + row.name, url: row.url, source: 'dom',
+    tag: 'dm:' + row.name, url: row.url, source: 'dom', kind,
   });
 }
 
@@ -238,26 +242,58 @@ function scanDom() {
   }
   if (!rows.length) return;
 
-  // 대화마다 상태를 두고 바뀔 때만 알린다. 입력 중 → 'typing', 읽지 않은 메시지 → 'msg|미리보기'.
-  // 미리보기까지 비교하므로 읽기 전에 메시지가 연달아 와도 매번 뜬다(같은 tag라 팝업은 교체됨).
+  // 대화마다 입력 중 여부와 마지막 미리보기를 두고 바뀔 때만 알린다.
+  //  - 입력 중 문구가 새로 보임 → typing
+  //  - 굵고 내 것이 아니며 알린 미리보기와 다름 → msg (읽기 전에 연달아 와도 매번)
+  //  - 입력 중이었고 미리보기가 입력 전과 다름 → msg (굵지 않아도: 메인 창에 열린 대화는 바로 읽음 처리됨, 11-04)
+  //    입력을 멈춰 미리보기가 원래대로 돌아온 것은 입력 전과 같으므로 알리지 않는다.
+  //  - 입력 중이었는데 둘 다 아님 → typing-stop (떠 있는 팝업의 표시만 지움)
   // 미리보기 끝의 시간("1분 → 2분")은 parseRow에서 지워서 매분 다시 알리지 않는다(10-30).
-  // 읽음(굵은 글씨 아님)으로 바뀌면 다음 새 메시지 때 다시 알릴 수 있게 지운다.
   const fresh = [];
   for (const r of rows) {
-    const kind = TYPING.test(r.preview) ? 'typing' : r.unread && !MINE.test(r.preview) ? 'msg' : '';
-    const state = kind === 'msg' ? 'msg|' + r.preview : kind;
-    if (!kind) {
-      if (notifiedRows.delete(r.name) && domSeeded) status({ source: 'dom', change: 'clear' });
-    } else if (notifiedRows.get(r.name) !== state) {
-      notifiedRows.set(r.name, state);
-      if (domSeeded) status({ source: 'dom', change: kind }); // 내용 없이 종류만 기록
-      fresh.push(r);
+    if (TYPING.test(r.preview)) {
+      if (!typingNow.has(r.name)) {
+        typingNow.add(r.name);
+        if (domSeeded) status({ source: 'dom', change: 'typing' }); // 내용 없이 종류만 기록
+        fresh.push([r, 'typing']);
+      }
+      continue;
+    }
+    const wasTyping = typingNow.delete(r.name);
+    const before = lastPreview.get(r.name);
+    lastPreview.set(r.name, r.preview);
+    const theirs = !MINE.test(r.preview);
+    let change = '';
+    if (r.unread && theirs && notifiedRows.get(r.name) !== r.preview) change = 'msg';
+    else if (wasTyping && theirs && before !== undefined && before !== r.preview && !ACTIVE.test(r.preview)
+      && notifiedRows.get(r.name) !== r.preview) change = 'msg-read';
+    if (change) {
+      notifiedRows.set(r.name, r.preview);
+      if (domSeeded) status({ source: 'dom', change });
+      fresh.push([r, 'msg']);
+    } else {
+      if (!r.unread && notifiedRows.delete(r.name) && domSeeded) status({ source: 'dom', change: 'clear' });
+      if (wasTyping) fresh.push([r, 'typing-stop']);
     }
   }
+  if (lastPreview.size > 200) lastPreview.delete(lastPreview.keys().next().value);
   if (!domSeeded) { domSeeded = true; return; } // 시작할 때 이미 있던 읽지 않음은 알리지 않음
   if (apiHealthy()) return; // 데이터 방식이 잘 되면 화면 읽기는 알리지 않음
 
-  fresh.slice(0, 3).reverse().forEach(domNotify);
+  // typing-stop은 새 팝업을 만들지 않으므로 개수 제한에서 뺀다
+  const stops = fresh.filter(([, k]) => k === 'typing-stop');
+  fresh.filter(([, k]) => k !== 'typing-stop').slice(0, 3).reverse().concat(stops)
+    .forEach(([r, k]) => domNotify(r, k));
+}
+
+// 목록이 바뀌면 바로 읽는다(1.5초 주기를 기다리지 않음). 화면만 읽으므로 요청은 늘지 않는다.
+let scanSoonTimer = null;
+function scanSoon() {
+  if (scanSoonTimer) return;
+  scanSoonTimer = setTimeout(() => {
+    scanSoonTimer = null;
+    try { scanDom(); } catch (e) { /* 구조가 바뀌어도 멈추지 않게 */ }
+  }, 300);
 }
 
 /* ================= 시작 ================= */
@@ -266,6 +302,9 @@ window.addEventListener('DOMContentLoaded', () => {
   setTimeout(() => checkInbox('start'), 4000);
   setInterval(() => checkInbox('interval'), API_INTERVAL_MS);
   setInterval(() => { try { scanDom(); } catch (e) { /* 구조가 바뀌어도 멈추지 않게 */ } }, 1500);
+  try {
+    new MutationObserver(scanSoon).observe(document.body, { childList: true, subtree: true, characterData: true });
+  } catch (e) { /* 안 되면 1.5초 주기만 쓴다 */ }
 });
 
 /* ================= 점검·진단 (메시지 내용은 보내지 않음) ================= */

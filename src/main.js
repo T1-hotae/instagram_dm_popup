@@ -249,6 +249,7 @@ function createMainWindow() {
     if (input.type !== 'keyDown' || !input.control) return;
     const key = input.key.toLowerCase();
     if (key === 'r') wc.reload();
+    else if (key === 'w') mainWindow.close(); // X 버튼과 같이 트레이로 숨김
     else if (key === '=' || key === '+') zoom(0.5);
     else if (key === '-') zoom(-0.5);
     else if (key === '0') zoom(0);
@@ -447,10 +448,53 @@ function closePopup(win) {
   layoutPopups();
 }
 
+// 팝업에 넘길 내용. msg = 마지막 메시지('' 이면 아직 입력 중만), typing = 입력 중 표시, sound = 이번에 소리 낼지
+function popupPayload(p, sound) {
+  return {
+    title: p.data.title,
+    icon: p.data.icon,
+    msg: p.msg && !settings.preview ? '새 메시지가 도착했습니다.' : p.msg,
+    typing: p.typing,
+    typingText: p.typingText,
+    sound: sound && settings.sound,
+  };
+}
+
+function sendPopup(p, sound) {
+  if (p.win.isDestroyed()) return;
+  const keepSound = !p.loaded && p.pending && p.pending.sound; // 불러오기 전에 덮여도 소리는 남긴다
+  p.pending = popupPayload(p, sound || keepSound);
+  if (p.loaded) p.win.webContents.send('popup:update', p.pending);
+}
+
+// data.kind: 'msg'(기본) | 'typing' | 'typing-stop'. 같은 대화(tag)의 팝업은 창을 새로 만들지 않고 내용만 바꾼다.
 function showPopup(data) {
+  const kind = data.kind || 'msg';
+  const same = data.tag ? popups.find((p) => p.data.tag === data.tag && !p.win.isDestroyed()) : null;
+  if (kind === 'typing-stop') {
+    if (same && same.typing) {
+      same.typing = false;
+      if (!same.msg) return closePopup(same.win); // 입력만 하다 멈춤: 보여 줄 메시지가 없다
+      sendPopup(same, false);
+    }
+    return;
+  }
   if (!settings.notify) return log('팝업 생략', { reason: 'off' });
   // 창을 보고 있는 중이면 팝업을 띄우지 않는다
   if (mainWindow && mainWindow.isVisible() && mainWindow.isFocused()) return log('팝업 생략', { reason: 'focus' });
+
+  if (same) {
+    if (kind === 'typing') {
+      same.typing = true;
+      same.typingText = data.body;
+    } else {
+      same.msg = data.body;
+      same.typing = false;
+    }
+    if (data.icon) same.data.icon = data.icon;
+    log('팝업 갱신', { kind });
+    return sendPopup(same, kind === 'msg');
+  }
 
   // 페이지 알림과 감시 창이 같은 메시지를 동시에 알린 경우 한 번만 띄운다.
   // 화면 읽기(dom)끼리는 감시 창이 이미 "바뀐 것만" 보내므로 막지 않는다(입력 중 → 메시지 → 입력 중이 10초 안에 와도 뜨게).
@@ -460,18 +504,7 @@ function showPopup(data) {
   recentKeys.set(key, data.source);
   setTimeout(() => recentKeys.delete(key), 10000);
 
-  // 같은 대화(tag)의 팝업이 이미 떠 있으면 새 내용으로 교체
-  if (data.tag) {
-    const same = popups.find((p) => p.data.tag === data.tag);
-    if (same) closePopup(same.win);
-  }
   while (popups.length >= MAX_POPUPS) closePopup(popups[popups.length - 1].win);
-
-  const payload = {
-    ...data,
-    body: settings.preview ? data.body : '새 메시지가 도착했습니다.',
-    sound: settings.sound,
-  };
 
   const win = new BrowserWindow({
     width: POPUP_W,
@@ -496,13 +529,31 @@ function showPopup(data) {
   });
   win.setAlwaysOnTop(true, 'screen-saver');
 
-  popups.unshift({ win, data });
+  const p = {
+    win, data, loaded: false, pending: null,
+    msg: kind === 'typing' ? '' : data.body,
+    typing: kind === 'typing',
+    typingText: kind === 'typing' ? data.body : '',
+  };
+  popups.unshift(p);
   layoutPopups();
+  sendPopup(p, kind === 'msg');
 
-  win.loadFile(path.join(__dirname, 'popup', 'popup.html'), {
-    query: { d: JSON.stringify(payload) },
+  // 불러오는 동안 바뀐 내용은 pending에 모아 두었다가 다 불러온 뒤 한 번에 보낸다
+  win.webContents.once('did-finish-load', () => {
+    p.loaded = true;
+    if (p.pending) win.webContents.send('popup:update', p.pending);
   });
+  win.loadFile(path.join(__dirname, 'popup', 'popup.html'));
   win.once('ready-to-show', () => win.showInactive());
+}
+
+// 프로필 사진이 늦게 오면 떠 있는 팝업에 끼워 넣는다
+function setPopupIcon(tag, icon) {
+  const p = tag && popups.find((x) => x.data.tag === tag && !x.win.isDestroyed());
+  if (!p || !icon || p.data.icon === icon) return;
+  p.data.icon = icon;
+  sendPopup(p, false);
 }
 
 ipcMain.on('popup:click', (e) => {
@@ -535,17 +586,22 @@ ipcMain.on('dm:notify', async (_e, n) => {
     log('페이지 알림 무시', { apiHealthy: apiHealthy() });
     return;
   }
-  log('알림', { source, hasBody: !!n.body, hasIcon: !!n.icon });
-  const icon = await resolveAvatar(n.icon);
+  const kind = ['typing', 'typing-stop'].includes(n.kind) ? n.kind : 'msg';
+  if (kind !== 'typing-stop') log('알림', { source, kind, hasBody: !!n.body, hasIcon: !!n.icon });
+  const tag = String(n.tag || '');
+  // 사진을 기다리지 않고 바로 띄운다(기다리면 늦게 받은 "입력 중"이 먼저 온 메시지를 덮을 수 있음). 사진은 오면 끼운다.
   showPopup({
     id: Number(n.id) || 0,
     title: String(n.title || 'Instagram').slice(0, 100),
     body: String(n.body || '').slice(0, 300),
-    icon,
-    tag: String(n.tag || ''),
+    icon: avatarCache.get(n.icon) || '',
+    tag,
     url: isInstagram(n.url || '') ? n.url : '',
     source,
+    kind,
   });
+  if (kind === 'typing-stop') return;
+  if (!avatarCache.has(n.icon)) resolveAvatar(n.icon).then((icon) => setPopupIcon(tag, icon));
   flashIfHidden();
 });
 
