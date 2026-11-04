@@ -1,6 +1,11 @@
-// Instagram 페이지에 붙는 preload.
+// Instagram 페이지(메인 창의 igView)에 붙는 preload.
 // 1) 웹 Notification API를 가로채 메인 프로세스로 보내고 (→ 우측 하단 팝업)
-// 2) 탭 제목의 "(N)" 읽지 않음 숫자를 감시한다.
+// 2) 탭 제목의 "(N)" 읽지 않음 숫자를 감시하고
+// 3) 받은편지함 목록의 프로필 사진 클릭을 스토리 대신 대화 열기로 바꾼다.
+//
+// preload는 페이지와 다른 JS 세계(isolated world)에서 돈다. 그래서 페이지의 window.Notification을
+// 바꾸려면 webFrame.executeJavaScript로 페이지 세계에 코드를 넣고, 그 코드는 contextBridge로
+// 열어 둔 window.__instaDM으로만 이쪽과 말한다.
 const { contextBridge, ipcRenderer, webFrame } = require('electron');
 
 let clickHandler = null;
@@ -81,7 +86,7 @@ webFrame.executeJavaScript(`(() => {
   }
 
   // 받은편지함 목록의 프로필 사진(스토리 링)을 누르면 스토리 대신 그 대화를 연다.
-  // 목록 한 줄 판정은 감시 창(watcher-preload.js rowCandidates)과 같은 기준.
+  // 목록 한 줄 판정은 감시 창(watcher/preload.js rowCandidates)과 같은 기준.
   const isRow = (n) => {
     if (n.matches('a[href*="/direct/t/"]')) return true;
     if (!n.matches('[role="button"], [role="listitem"], [role="link"]')) return false;

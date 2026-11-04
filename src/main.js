@@ -1,3 +1,9 @@
+// 메인 프로세스. 창·트레이·팝업·설정·로그와 모든 IPC를 여기서 다룬다.
+// 창은 넷이고, 각자 src/<창>/ 폴더에 화면과 preload가 있다.
+//   메인 창  = titlebar/(타이틀바) + instagram/(그 아래 Instagram 화면, igView)
+//   감시 창  = watcher/ (숨은 받은편지함, 새 DM 감지)
+//   팝업     = popup/   (오른쪽 아래 알림)
+// 전체 그림은 docs/[00] 구조.md, 쓰인 기술과 원리는 docs/[03] 기술과 원리.md에 있다.
 const {
   app, BrowserWindow, WebContentsView, Tray, Menu, ipcMain, screen, shell, nativeImage, nativeTheme, session, dialog,
 } = require('electron');
@@ -5,6 +11,8 @@ const path = require('path');
 const fs = require('fs');
 
 const INBOX_URL = 'https://www.instagram.com/direct/inbox/';
+// igView, 감시 창, 로그인 창은 모두 partition 'persist:instagram'을 쓴다.
+// 쿠키를 함께 쓰므로 메인 창에서 한 번 로그인하면 감시 창도 로그인된 상태가 된다.
 const ASSETS = path.join(__dirname, '..', 'assets');
 const START_HIDDEN = process.argv.includes('--hidden');
 
@@ -13,6 +21,7 @@ app.userAgentFallback = app.userAgentFallback
   .replace(/\s?Electron\/\S+/, '')
   .replace(/\s?insta-dm\/\S+/i, '');
 
+// 한 번에 하나만 실행. 두 번째로 띄우면 바로 끝나고 기존 창이 앞으로 나온다(second-instance).
 if (!app.requestSingleInstanceLock()) {
   app.quit();
   process.exit(0);
@@ -114,18 +123,18 @@ function createMainWindow() {
     frame: false,
     backgroundColor: nativeTheme.shouldUseDarkColors ? '#000000' : '#ffffff',
     webPreferences: {
-      preload: path.join(__dirname, 'titlebar-preload.js'),
+      preload: path.join(__dirname, 'titlebar', 'preload.js'),
       contextIsolation: true,
       sandbox: true,
       nodeIntegration: false,
     },
   });
-  mainWindow.loadFile(path.join(__dirname, 'titlebar.html'));
+  mainWindow.loadFile(path.join(__dirname, 'titlebar', 'titlebar.html'));
 
   igView = new WebContentsView({
     webPreferences: {
       partition: 'persist:instagram', // 로그인 유지
-      preload: path.join(__dirname, 'preload.js'),
+      preload: path.join(__dirname, 'instagram', 'preload.js'),
       contextIsolation: true,
       sandbox: true,
       nodeIntegration: false,
@@ -319,7 +328,7 @@ function createWatcherWindow() {
     skipTaskbar: true,
     webPreferences: {
       partition: 'persist:instagram',
-      preload: path.join(__dirname, 'watcher-preload.js'),
+      preload: path.join(__dirname, 'watcher', 'preload.js'),
       contextIsolation: true,
       sandbox: true,
       backgroundThrottling: false, // 숨겨진 창에서도 주기적으로 확인
@@ -477,7 +486,7 @@ function showPopup(data) {
     show: false,
     hasShadow: false,
     webPreferences: {
-      preload: path.join(__dirname, 'popup-preload.js'),
+      preload: path.join(__dirname, 'popup', 'preload.js'),
       contextIsolation: true,
       sandbox: true,
       autoplayPolicy: 'no-user-gesture-required',
@@ -488,7 +497,7 @@ function showPopup(data) {
   popups.unshift({ win, data });
   layoutPopups();
 
-  win.loadFile(path.join(__dirname, 'popup.html'), {
+  win.loadFile(path.join(__dirname, 'popup', 'popup.html'), {
     query: { d: JSON.stringify(payload) },
   });
   win.once('ready-to-show', () => win.showInactive());

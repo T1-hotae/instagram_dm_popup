@@ -6,6 +6,7 @@
 - `docs/[00] 구조.md`: 창 구성, 알림 흐름, IPC 채널
 - `docs/[01] 업데이트 내역.md`: 최근 변경과 남은 문제
 - `docs/[02] 알림 구현 원리.md`: 알림 감지 규칙. 알림 코드를 고치면 이 문서부터 고친다
+- `docs/[03] 기술과 원리.md`: 쓴 기술과 기능별 동작 원리. 처음 보는 사람은 이것부터
 
 ## 문서 습관 (필수)
 - 코드를 바꾸면 **같은 작업 안에서** `docs/[01] 업데이트 내역.md` 맨 위에 날짜별 항목을 추가한다. 항목에는 증상, 원인, 수정, 남은 문제를 적는다.
@@ -28,12 +29,12 @@ npm run dist         # dist/에 설치 파일 만들기
 - **로그와 진단 파일에 메시지 내용, 이름, 프로필 URL을 남기지 않는다.** 상태, 개수, 경로(pathname)만 남긴다.
 - Instagram 페이지는 `igView.webContents`이고, `mainWindow.webContents`는 타이틀바다. 헷갈리지 않는다.
 - 모든 창은 `contextIsolation: true`, `sandbox: true`로 둔다. 페이지와는 preload의 `contextBridge`와 IPC로만 주고받는다.
-- `preload.js`의 `webFrame.executeJavaScript` 템플릿 문자열 안에서는 백슬래시를 두 번 쓴다(`'\\n'`). 백틱과 `${`는 쓰지 않는다.
+- `instagram/preload.js`의 `webFrame.executeJavaScript` 템플릿 문자열 안에서는 백슬래시를 두 번 쓴다(`'\\n'`). 백틱과 `${`는 쓰지 않는다.
 - Instagram 내부 경로와 DOM 구조는 언제든 바뀐다. 실패해도 멈추지 않게 `try/catch`로 감싸고 더 단순한 대체 경로를 남긴다. 계정 보호를 위해 요청 빈도를 늘리지 않는다(401/403/429면 10분 멈춤).
 - 알림은 **새 DM과 상대의 입력 중**일 때만 띄운다. 좋아요 같은 활동 알림이나 이미 읽은 메시지가 팝업이 되는 변경은 하지 않는다.
 - 사용자가 증상을 말하면 대화방 화면 문제인지 팝업 문제인지 먼저 가린다.
 
 ## 확인
-- 테스트 코드는 없다. `node --check src/*.js`로 문법을 확인한 뒤 앱을 실행해서 본다.
+- 테스트 코드는 없다. `node --check src/main.js src/*/preload.js`로 문법을 확인한 뒤 앱을 실행해서 본다.
 - 트레이 → **알림 경로 점검**, **로그 파일 열기**(`%APPDATA%\insta-dm\insta-dm.log`), **감시 창 보기**로 동작을 확인한다.
 - 커밋 메시지는 `fix: …`, `feat: …`, `docs: …` 형식으로 쓴다.
