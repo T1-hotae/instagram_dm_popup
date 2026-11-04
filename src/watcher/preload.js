@@ -296,6 +296,23 @@ function scanSoon() {
   }, 300);
 }
 
+// 팝업 클릭(화면 읽기 알림은 대화 주소가 없을 수 있음): 이름으로 목록 줄을 찾아 주소를 알려 준다.
+// 줄에 링크가 없는 구조면 이름 글자를 눌러 Instagram이 대화를 열게 한다(main이 그 이동을 채팅 창으로 넘김).
+// 사진을 누르면 스토리가 열리므로 이름을 누른다.
+ipcRenderer.on('watcher:open', (_e, name) => {
+  try {
+    const el = rowCandidates().find((r) => parseRow(r).name === name);
+    if (!el) return ipcRenderer.send('watcher:open-result', '');
+    const { url } = parseRow(el);
+    if (url) return ipcRenderer.send('watcher:open-result', url);
+    const label = [...el.querySelectorAll('span')]
+      .find((s) => s.childElementCount === 0 && s.textContent.trim() === name);
+    (label || el).click();
+  } catch (e) {
+    ipcRenderer.send('watcher:open-result', '');
+  }
+});
+
 /* ================= 시작 ================= */
 
 window.addEventListener('DOMContentLoaded', () => {

@@ -69,6 +69,26 @@ function hideSideColumns() {
       if (s === n || s.hasAttribute(HIDDEN)) continue;
       const r = s.getBoundingClientRect();
       if (r.width > 0 && (r.right <= pr.left + 1 || r.left >= pr.right - 1)) hide(s);
+      // 아래쪽 형제: 숨긴 하단 탭바 자리를 비워 두는 빈 칸
+      else if (r.height > 0 && r.top >= pr.bottom - 1) hide(s);
+    }
+  }
+  trimBottom(box);
+}
+
+// 아래 여백: 입력창 아래가 크게 비어 있으면(하단 탭바 높이만큼 남겨 둔 자리) 조상의 아래쪽 안쪽·바깥 여백을 없애고,
+// 화면 높이에서 탭바만큼 뺀 고정 높이를 화면 높이로 늘린다.
+function trimBottom(box) {
+  if (window.innerHeight - box.getBoundingClientRect().bottom < 40) return;
+  for (let n = box.parentElement; n && n !== document.documentElement; n = n.parentElement) {
+    const cs = getComputedStyle(n);
+    if (parseFloat(cs.paddingBottom) >= 30) n.style.setProperty('padding-bottom', '0', 'important');
+    if (parseFloat(cs.marginBottom) >= 30) n.style.setProperty('margin-bottom', '0', 'important');
+    const r = n.getBoundingClientRect();
+    const short = window.innerHeight - r.height;
+    if (r.top < 1 && r.height >= window.innerHeight * 0.6 && short >= 30 && short <= 80) {
+      n.style.setProperty('height', '100vh', 'important');
+      n.style.setProperty('max-height', 'none', 'important');
     }
   }
 }

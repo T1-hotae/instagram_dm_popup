@@ -205,17 +205,15 @@ function createMainWindow() {
     if (lastMainUrl.includes('/accounts/') && !url.includes('/accounts/')) reloadWatcherSoon();
     lastMainUrl = url;
     const p = new URL(url).pathname;
-    if (p.startsWith('/accounts/') || p.startsWith('/challenge')) log('메인 이동', p);
+    if (/^\/(accounts|challenge|direct)/.test(p)) log('메인 이동', p.replace(/\/t\/[^/]+/, '/t/ID'));
     // 받은편지함 사진 클릭을 막지 못해 스토리가 열렸으면 되돌린다
     if (p.startsWith('/stories/') && Date.now() - avatarClickAt < 1500) {
       avatarClickAt = 0;
       if (wc.navigationHistory.canGoBack()) wc.navigationHistory.goBack();
     }
-    // 대화를 열면 채팅 창으로 넘기고 메인 창은 받은편지함으로 되돌린다
-    if (settings.chatWindow && openChat(url)) {
-      if (wc.navigationHistory.canGoBack()) wc.navigationHistory.goBack();
-      else wc.loadURL(INBOX_URL);
-    }
+    // 대화를 열면 채팅 창으로 넘기고 메인 창은 받은편지함으로 되돌린다.
+    // goBack은 주소만 돌아가고 Instagram 안에서는 그 대화가 선택된 채로 남아, 같은 사람을 다시 눌러도 이동하지 않았다. 그래서 새로 불러온다.
+    if (settings.chatWindow && openChat(url)) wc.loadURL(INBOX_URL);
     syncTheme();
   };
   wc.on('did-navigate', onMainNavigate);
@@ -361,6 +359,15 @@ function createWatcherWindow() {
       watcherRetryTimer = setTimeout(() => watcherWindow && !watcherWindow.isDestroyed() && watcherWindow.loadURL(INBOX_URL), 60000);
     }
   });
+  // 팝업 클릭으로 감시 창이 대화 줄을 눌렀으면(watcher:open) 그 대화를 채팅 창으로 열고 감시 창은 받은편지함으로 돌린다
+  watcherWindow.webContents.on('did-navigate-in-page', (_e, url) => {
+    if (!pendingOpen || !threadIdOf(url)) return;
+    openChat(url);
+    const wc = watcherWindow.webContents;
+    if (wc.navigationHistory.canGoBack()) wc.navigationHistory.goBack();
+    else wc.loadURL(INBOX_URL);
+  });
+
   // 메모리 누수 방지를 위해 3시간마다 새로고침
   setInterval(() => watcherWindow && !watcherWindow.isDestroyed() && watcherWindow.loadURL(INBOX_URL), 3 * 60 * 60 * 1000);
 
@@ -436,27 +443,36 @@ function showMain(url) {
 // 창마다 Instagram 페이지가 통째로 떠서(약 200MB) 개수를 제한한다. 넘치면 가장 먼저 연 창을 닫는다.
 const MAX_CHATS = 4;
 const chatWindows = new Map(); // thread id → 창
+let warmChat = null; // 받은편지함을 미리 불러 둔 숨은 채팅 창. 열 때 페이지를 처음부터 받는 시간을 줄인다
+let pendingOpen = 0; // 팝업 클릭으로 대화를 찾는 중이면 마감 시각 (openChat이 열면 0)
 
 function threadIdOf(url) {
   try {
-    const m = /^\/direct\/t\/([^/]+)/.exec(new URL(url).pathname);
+    const m = /^\/direct\/t\/([\w.-]+)/.exec(new URL(url).pathname);
     return m ? m[1] : '';
   } catch {
     return '';
   }
 }
 
-const isChatContents = (wc) => [...chatWindows.values()].some((w) => !w.isDestroyed() && w.webContents === wc);
+const threadUrl = (id) => `https://www.instagram.com/direct/t/${id}/`;
+const isChatContents = (wc) => [...chatWindows.values(), warmChat]
+  .some((w) => w && !w.isDestroyed() && w.webContents === wc);
 
 // 대화 주소면 채팅 창을 열고(이미 있으면 앞으로) true, 아니면 false
 function openChat(url) {
-  let id = threadIdOf(url);
+  const id = threadIdOf(url);
   if (!id) return false;
+  pendingOpen = 0;
   const open = chatWindows.get(id);
   if (open && !open.isDestroyed()) {
+    // 대화로 못 옮겨 가고 받은편지함에 멈춘 창이면 앞으로만 가져와서는 안 열린 것처럼 보인다
+    if (!threadIdOf(open.webContents.getURL())) open.webContents.loadURL(threadUrl(id));
     if (open.isMinimized()) open.restore();
     open.show();
+    open.moveTop();
     open.focus();
+    log('채팅 창 앞으로', { visible: open.isVisible() });
     return true;
   }
   while (chatWindows.size >= MAX_CHATS) {
@@ -464,15 +480,51 @@ function openChat(url) {
     chatWindows.delete(oldId);
     if (!w.isDestroyed()) w.destroy();
   }
+  const warm = takeWarmChat(id);
+  chatWindows.set(id, warm || createChatWindow(threadUrl(id), id));
+  log('채팅 창 열기', { open: chatWindows.size, warm: !!warm });
+  setTimeout(prepareWarmChat, 5000); // 다음 대화를 위해 하나 더 준비
+  return true;
+}
 
+// 숨은 채팅 창 하나를 받은편지함으로 불러 둔다 (설정이 켜져 있을 때만, 하나만)
+function prepareWarmChat() {
+  if (!settings.chatWindow || (warmChat && !warmChat.isDestroyed())) return;
+  const win = createChatWindow(INBOX_URL, '');
+  warmChat = win;
+  win.webContents.once('did-finish-load', () => { win.ready = true; });
+}
+
+// 미리 띄운 창을 그 대화로 옮긴다. 렌더러와 창은 이미 떠 있어서 새 창보다 빠르다.
+// popstate로 페이지 안에서만 옮기던 방식은 주소만 바뀌고 화면은 받은편지함에 남아서(11-04 로그) 그냥 불러온다.
+function takeWarmChat(id) {
+  const win = warmChat;
+  if (!win || win.isDestroyed() || !win.ready) return null;
+  warmChat = null;
+  win.chatId = id;
+  win.setSkipTaskbar(false);
+  const wc = win.webContents;
+  wc.loadURL(threadUrl(id));
+  // 받은편지함이 잠깐 비치지 않게 화면이 바뀔 틈을 주고 띄운다
+  setTimeout(() => {
+    if (win.isDestroyed()) return;
+    win.show();
+    wc.focus();
+  }, 200);
+  return win;
+}
+
+// 채팅 창 하나 만들기. win.chatId가 비어 있으면 아직 대화가 정해지지 않은 미리 띄운 창
+function createChatWindow(loadUrl, chatId) {
   const win = new BrowserWindow({
-    width: 420,
-    height: 680,
+    width: 500,
+    height: 800,
     minWidth: 320,
     minHeight: 400,
     title: 'InstaDM',
     icon: path.join(ASSETS, 'icon.png'),
     show: false,
+    skipTaskbar: !chatId,
     backgroundColor: nativeTheme.shouldUseDarkColors ? '#000000' : '#ffffff',
     webPreferences: {
       partition: 'persist:instagram',
@@ -483,16 +535,25 @@ function openChat(url) {
       spellcheck: false,
     },
   });
-  chatWindows.set(id, win);
-  win.on('closed', () => { if (chatWindows.get(id) === win) chatWindows.delete(id); });
-  log('채팅 창 열기', { open: chatWindows.size });
+  win.chatId = chatId;
+  win.on('show', () => {
+    win.shownAt = Date.now();
+    log('채팅 창 표시');
+  });
+  win.on('closed', () => {
+    if (chatWindows.get(win.chatId) === win) chatWindows.delete(win.chatId);
+    if (warmChat === win) warmChat = null;
+  });
 
   const wc = win.webContents;
-  wc.loadURL(`https://www.instagram.com/direct/t/${id}/`);
-  win.once('ready-to-show', () => {
+  wc.loadURL(loadUrl);
+  const showChat = () => {
+    if (!win.chatId || win.isDestroyed() || win.isVisible()) return; // 미리 띄운 창은 takeWarmChat이 띄운다
     win.show();
     wc.focus();
-  });
+  };
+  win.once('ready-to-show', showChat);
+  if (chatId) setTimeout(showChat, 3000); // ready-to-show가 안 와도 창이 숨은 채 남지 않게
 
   // 포커스가 없으면 페이지에 숨겨진 것으로 알려 읽음 처리를 막는다 (chat/preload.js)
   const setActive = () => !wc.isDestroyed() && wc.send('chat:active', win.isFocused());
@@ -503,19 +564,30 @@ function openChat(url) {
   // 이 대화 밖으로 나가는 이동(프로필 등)은 메인 창에서 열고 채팅 창은 대화에 남긴다.
   // 받은편지함으로 가는 것(모바일 화면의 ← 버튼)은 창 닫기로 본다.
   const onNavigate = (_e, navUrl) => {
+    if (!win.chatId) return; // 미리 띄운 창은 받은편지함에 머문다
     const p = new URL(navUrl).pathname;
     const tid = threadIdOf(navUrl);
     if (tid) {
       // Instagram이 주소의 id를 바꿔 쓰는 경우도 같은 창으로 찾을 수 있게 다시 등록
-      if (tid !== id && !chatWindows.has(tid)) {
-        if (chatWindows.get(id) === win) chatWindows.delete(id);
-        id = tid;
-        chatWindows.set(id, win);
+      if (tid !== win.chatId && !chatWindows.has(tid)) {
+        if (chatWindows.get(win.chatId) === win) chatWindows.delete(win.chatId);
+        win.chatId = tid;
+        chatWindows.set(tid, win);
       }
       return;
     }
+    log('채팅 창 이동', p.replace(/\/t\/[^/]+/, '/t/ID'));
     if (p.startsWith('/accounts/') || p.startsWith('/challenge')) return;
     if (p.startsWith('/direct/inbox')) {
+      // 막 열린 창이 받은편지함을 거쳐 가는 경우가 있어(로그상 창이 뜨기도 전에 닫힘) 그때는 대화를 한 번 다시 불러온다.
+      // 창이 떠서 3초 넘게 지난 뒤의 받은편지함 이동만 ← 버튼으로 보고 닫는다.
+      if (!win.shownAt || Date.now() - win.shownAt < 3000) {
+        if (!win.retried) {
+          win.retried = true;
+          wc.loadURL(threadUrl(win.chatId));
+        }
+        return;
+      }
       win.close();
       return;
     }
@@ -532,8 +604,43 @@ function openChat(url) {
 
   guardLinks(wc, win, (u) => (openChat(u) ? null : showMain(u)));
   bindKeys(wc, () => win.close());
-  return true;
+  return win;
 }
+
+// 팝업 클릭: 그 사람 채팅 창을 바로 연다.
+// 주소가 있으면 바로 열고, 페이지 알림이면 onclick으로 Instagram이 대화로 이동하게 한다(onMainNavigate가 채팅 창으로 넘김).
+// 화면 읽기 알림처럼 주소가 없으면 감시 창이 목록에서 그 이름 줄을 찾는다. 3초 안에 못 열면 메인 창을 연다.
+function openFromPopup(d) {
+  if (!settings.chatWindow) {
+    if (d.id && igView) {
+      igView.webContents.send('dm:click', d.id); // 페이지가 등록한 알림 onclick → 그 대화로 이동
+      return showMain();
+    }
+    return showMain(d.url || INBOX_URL);
+  }
+  if (openChat(d.url)) return;
+  if (d.id && igView) igView.webContents.send('dm:click', d.id);
+  else if (d.tag.startsWith('dm:') && watcherWindow && !watcherWindow.isDestroyed()) {
+    watcherWindow.webContents.send('watcher:open', d.tag.slice(3));
+  } else return showMain(INBOX_URL);
+  const deadline = Date.now() + 3000;
+  pendingOpen = deadline;
+  setTimeout(() => {
+    if (pendingOpen !== deadline) return;
+    pendingOpen = 0;
+    log('팝업 대화 찾기 실패');
+    showMain();
+  }, 3000);
+}
+
+// 감시 창이 이름으로 찾은 대화 주소 ('' = 못 찾음)
+ipcMain.on('watcher:open-result', (_e, url) => {
+  if (pendingOpen && !openChat(url)) {
+    pendingOpen = 0;
+    log('팝업 대화 찾기 실패');
+    showMain();
+  }
+});
 
 // 채팅 창에서 Esc (대화 상자가 없을 때)
 ipcMain.on('chat:close', (e) => {
@@ -684,16 +791,7 @@ function setPopupIcon(tag, icon) {
 ipcMain.on('popup:click', (e) => {
   const win = BrowserWindow.fromWebContents(e.sender);
   const p = popups.find((x) => x.win === win);
-  if (p) {
-    if (p.data.id && igView) {
-      // 페이지가 등록한 알림 onclick을 실행 → Instagram이 해당 대화로 이동
-      igView.webContents.send('dm:click', p.data.id);
-      // 채팅 창 설정이 켜져 있으면 메인 창의 대화 이동을 onMainNavigate가 채팅 창으로 넘긴다
-      showMain();
-    } else if (!(settings.chatWindow && openChat(p.data.url))) {
-      showMain(p.data.url || INBOX_URL);
-    }
-  }
+  if (p) openFromPopup(p.data);
   if (win) closePopup(win);
 });
 
@@ -919,6 +1017,7 @@ app.whenReady().then(() => {
   createWatcherWindow();
   createTray();
   screen.on('display-metrics-changed', layoutPopups);
+  setTimeout(prepareWarmChat, 15000); // 시작 직후 로딩과 겹치지 않게 조금 뒤에
 
   // 절전·화면 잠금 동안 감시 창 타이머가 멈춘다(11-04 로그에 6분 공백). 돌아오면 감시 창을 다시 불러온다.
   // 다시 불러오면 첫 검사는 기준만 잡으므로 그동안 쌓인 것이 한꺼번에 뜨지는 않는다.
