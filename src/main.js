@@ -5,7 +5,7 @@
 //   팝업     = popup/   (오른쪽 아래 알림)
 // 전체 그림은 docs/[00] 구조.md, 쓰인 기술과 원리는 docs/[03] 기술과 원리.md에 있다.
 const {
-  app, BrowserWindow, WebContentsView, Tray, Menu, ipcMain, screen, shell, nativeImage, nativeTheme, session, dialog,
+  app, BrowserWindow, WebContentsView, Tray, Menu, ipcMain, screen, shell, nativeImage, nativeTheme, session, dialog, powerMonitor,
 } = require('electron');
 const path = require('path');
 const fs = require('fs');
@@ -425,7 +425,7 @@ const POPUP_H = 104;
 const POPUP_GAP = 4;
 const MAX_POPUPS = 4;
 const popups = [];
-const recentKeys = new Set();
+const recentKeys = new Map(); // '제목|내용' → 보낸 곳(source)
 
 function layoutPopups() {
   const { workArea } = screen.getPrimaryDisplay();
@@ -448,14 +448,16 @@ function closePopup(win) {
 }
 
 function showPopup(data) {
-  if (!settings.notify) return;
+  if (!settings.notify) return log('팝업 생략', { reason: 'off' });
   // 창을 보고 있는 중이면 팝업을 띄우지 않는다
-  if (mainWindow && mainWindow.isVisible() && mainWindow.isFocused()) return;
+  if (mainWindow && mainWindow.isVisible() && mainWindow.isFocused()) return log('팝업 생략', { reason: 'focus' });
 
-  // 페이지 알림과 감시 창이 같은 메시지를 동시에 알린 경우 한 번만 띄운다
+  // 페이지 알림과 감시 창이 같은 메시지를 동시에 알린 경우 한 번만 띄운다.
+  // 화면 읽기(dom)끼리는 감시 창이 이미 "바뀐 것만" 보내므로 막지 않는다(입력 중 → 메시지 → 입력 중이 10초 안에 와도 뜨게).
   const key = data.title + '|' + data.body;
-  if (recentKeys.has(key)) return;
-  recentKeys.add(key);
+  const prev = recentKeys.get(key);
+  if (prev && (prev !== 'dom' || data.source !== 'dom')) return log('팝업 생략', { reason: 'dup' });
+  recentKeys.set(key, data.source);
   setTimeout(() => recentKeys.delete(key), 10000);
 
   // 같은 대화(tag)의 팝업이 이미 떠 있으면 새 내용으로 교체
@@ -542,6 +544,7 @@ ipcMain.on('dm:notify', async (_e, n) => {
     icon,
     tag: String(n.tag || ''),
     url: isInstagram(n.url || '') ? n.url : '',
+    source,
   });
   flashIfHidden();
 });
@@ -733,6 +736,15 @@ app.whenReady().then(() => {
   createWatcherWindow();
   createTray();
   screen.on('display-metrics-changed', layoutPopups);
+
+  // 절전·화면 잠금 동안 감시 창 타이머가 멈춘다(11-04 로그에 6분 공백). 돌아오면 감시 창을 다시 불러온다.
+  // 다시 불러오면 첫 검사는 기준만 잡으므로 그동안 쌓인 것이 한꺼번에 뜨지는 않는다.
+  const reloadWatcher = (why) => {
+    log('감시 창 다시 불러옴', why);
+    if (watcherWindow && !watcherWindow.isDestroyed()) watcherWindow.loadURL(INBOX_URL);
+  };
+  powerMonitor.on('resume', () => reloadWatcher('resume'));
+  powerMonitor.on('unlock-screen', () => reloadWatcher('unlock'));
 
   // npm run test-popup: 시작 후 예시 알림 두 개 띄우기
   if (process.argv.includes('--test-popup')) {

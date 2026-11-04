@@ -168,13 +168,15 @@ ipcRenderer.on('watcher:check', () => scheduleCheck('unread', 500));
 
 /* ================= 2순위: 화면 목록 읽기 ================= */
 
-const notifiedRows = new Map(); // 대화 이름 → 마지막으로 알린 종류 ('typing' | 'msg')
+const notifiedRows = new Map(); // 대화 이름 → 마지막으로 알린 상태 ('typing' | 'msg|미리보기')
 let domSeeded = false;
 let lastCount = 0;
 
 const MINE = /^(나|회원님|You)\s*:/; // 내가 보낸 메시지
-const TYPING = /입력\s*중|typing/i; // 상대가 입력 중일 때 미리보기 자리에 뜨는 문구
+const TYPING = /입력\s*(하는\s*)?중|작성\s*(하는\s*)?중|typing/i; // 상대가 입력 중일 때 미리보기 자리에 뜨는 문구
 const TIME_SUFFIX = /\s*[·•]\s*[^·•]{1,8}$/; // " · 1분" 같은 시간 표시
+// 시간이 따로 줄에 붙어 " 1분", " 방금"으로 끝나는 경우. 미리보기로 상태를 비교하므로 매분 바뀌는 글자는 꼭 지운다.
+const TIME_TAIL = /\s+(방금|지금|\d+\s*(초|분|시간|일|주)(\s*전)?|now|\d+\s*[smhdw])$/i;
 
 function rowCandidates() {
   const links = [...document.querySelectorAll('a[href*="/direct/t/"]')];
@@ -195,7 +197,7 @@ function rowCandidates() {
 function parseRow(el) {
   const lines = (el.innerText || '').split('\n').map((s) => s.trim()).filter(Boolean);
   const name = lines[0];
-  const preview = lines.slice(1).join(' ').replace(TIME_SUFFIX, '').trim();
+  const preview = lines.slice(1).join(' ').replace(TIME_SUFFIX, '').replace(TIME_TAIL, '').trim();
   const spans = [...el.querySelectorAll('span')].filter((s) => s.childElementCount === 0 && s.textContent.trim());
   const previewSpan = spans.find((s) => !name.includes(s.textContent.trim()));
   const unread = previewSpan ? parseInt(getComputedStyle(previewSpan).fontWeight, 10) >= 600 : false;
@@ -212,7 +214,13 @@ function domNotify(row) {
 }
 
 let lastDomStatusAt = 0;
+let lastScanAt = 0;
 function scanDom() {
+  // 검사 간격이 크게 벌어졌으면(절전 등으로 타이머가 멈춤) 기록한다
+  const gap = lastScanAt ? Date.now() - lastScanAt : 0;
+  lastScanAt = Date.now();
+  if (gap > 10000) status({ source: 'dom', stalledSec: Math.round(gap / 1000) });
+
   const m = /^\((\d+)\)/.exec(document.title || '');
   const count = m ? parseInt(m[1], 10) : 0;
   if (count > lastCount) {
@@ -225,20 +233,24 @@ function scanDom() {
   if (Date.now() - lastDomStatusAt > 30000) {
     lastDomStatusAt = Date.now();
     status({ source: 'dom', path: location.pathname, titleCount: count, rows: rows.length,
-      unreadRows: rows.filter((r) => r.unread).length, hidden: document.hidden });
+      unreadRows: rows.filter((r) => r.unread).length, typingRows: rows.filter((r) => TYPING.test(r.preview)).length,
+      hidden: document.hidden });
   }
   if (!rows.length) return;
 
-  // 입력 중 → 'typing', 읽지 않은 메시지 → 'msg'로 대화마다 상태를 두고, 상태가 바뀔 때만 알린다.
-  // 그래서 "입력 중" 팝업 뒤 실제 메시지가 오면 메시지 팝업이 다시 뜬다(같은 tag라 팝업은 교체됨).
-  // 미리보기 글자는 "1분 → 2분"처럼 계속 바뀌어서 기준으로 쓰지 않는다.
+  // 대화마다 상태를 두고 바뀔 때만 알린다. 입력 중 → 'typing', 읽지 않은 메시지 → 'msg|미리보기'.
+  // 미리보기까지 비교하므로 읽기 전에 메시지가 연달아 와도 매번 뜬다(같은 tag라 팝업은 교체됨).
+  // 미리보기 끝의 시간("1분 → 2분")은 parseRow에서 지워서 매분 다시 알리지 않는다(10-30).
   // 읽음(굵은 글씨 아님)으로 바뀌면 다음 새 메시지 때 다시 알릴 수 있게 지운다.
   const fresh = [];
   for (const r of rows) {
     const kind = TYPING.test(r.preview) ? 'typing' : r.unread && !MINE.test(r.preview) ? 'msg' : '';
-    if (!kind) notifiedRows.delete(r.name);
-    else if (notifiedRows.get(r.name) !== kind) {
-      notifiedRows.set(r.name, kind);
+    const state = kind === 'msg' ? 'msg|' + r.preview : kind;
+    if (!kind) {
+      if (notifiedRows.delete(r.name) && domSeeded) status({ source: 'dom', change: 'clear' });
+    } else if (notifiedRows.get(r.name) !== state) {
+      notifiedRows.set(r.name, state);
+      if (domSeeded) status({ source: 'dom', change: kind }); // 내용 없이 종류만 기록
       fresh.push(r);
     }
   }
