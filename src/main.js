@@ -13,10 +13,6 @@ app.userAgentFallback = app.userAgentFallback
   .replace(/\s?Electron\/\S+/, '')
   .replace(/\s?insta-dm\/\S+/i, '');
 
-// Windows 창 가림 계산이 숨김→표시 뒤에도 igView를 "안 보임"으로 남겨 두면 화면이 하얗거나
-// 대화방 메시지 목록(보일 때만 그리는 목록)이 비어 보인다. 가림 계산을 끈다.
-app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion');
-
 if (!app.requestSingleInstanceLock()) {
   app.quit();
   process.exit(0);
@@ -601,7 +597,7 @@ function badgeCount() {
 function updateBadge() {
   if (!tray) return;
   const n = badgeCount();
-  tray.setToolTip(n ? `InstaDM — 읽지 않음 ${n}` : 'InstaDM');
+  tray.setToolTip(`InstaDM ${app.getVersion()}${n ? ` — 읽지 않음 ${n}` : ''}`);
   if (mainWindow) {
     mainWindow.setOverlayIcon(
       n ? nativeImage.createFromPath(path.join(ASSETS, 'badge.png')) : null,
@@ -689,6 +685,7 @@ function menuTemplate() {
       click: () => watcherWindow && watcherWindow.webContents.send('watcher:dump'),
     },
     { type: 'separator' },
+    { label: `버전 ${app.getVersion()}`, enabled: false },
     { label: '종료', click: () => { quitting = true; app.quit(); } },
   ];
 }
@@ -700,7 +697,7 @@ function refreshMenus() {
 
 function createTray() {
   tray = new Tray(nativeImage.createFromPath(path.join(ASSETS, 'tray.png')));
-  tray.setToolTip('InstaDM');
+  tray.setToolTip(`InstaDM ${app.getVersion()}`);
   refreshMenus();
   tray.on('click', () => showMain());
 }
