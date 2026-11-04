@@ -10,7 +10,7 @@
 
 ![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?logo=windows&logoColor=white)
 ![Electron](https://img.shields.io/badge/Electron-33-47848F?logo=electron&logoColor=white)
-![version](https://img.shields.io/badge/version-1.0.4-E1306C)
+![version](https://img.shields.io/badge/version-1.1.3-E1306C)
 
 ### [⬇️ Windows 설치 파일 받기](https://github.com/T1-hotae/instagram_dm_popup/releases/latest)
 
