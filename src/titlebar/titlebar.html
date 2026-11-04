@@ -81,7 +81,7 @@
 <body>
 <div class="bar" id="bar">
   <div class="brand">
-    <img src="../assets/icon.png" alt="">
+    <img src="../../assets/icon.png" alt="">
     <span class="title">InstaDM</span>
     <span class="pill" id="pill"></span>
   </div>
@@ -107,7 +107,10 @@
   </div>
 </div>
 <script>
-  const $ = (id) => document.getElementById(id);
+  // 메인 창은 테두리가 없어서(frame: false) 이 36px 줄이 창 제목줄 역할을 한다.
+  // 드래그는 CSS -webkit-app-region: drag로, 버튼은 preload의 window.titlebar로 메인에 보낸다.
+  // 읽지 않음 수·최대화·포커스·Instagram 테마는 main.js sendTitlebarState가 보내 준다.
+  const $ =(id) => document.getElementById(id);
   const tb = window.titlebar;
 
   $('min').addEventListener('click', () => tb.minimize());

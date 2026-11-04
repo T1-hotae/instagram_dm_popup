@@ -63,7 +63,9 @@
   <button class="close" id="close" title="닫기">✕</button>
 </div>
 <script>
-  const data = JSON.parse(new URLSearchParams(location.search).get('d') || '{}');
+  // 팝업 창 하나 = 알림 하나. 위치·쌓기·교체는 main.js(showPopup, layoutPopups)가 하고,
+  // 여기서는 그리기·소리·자동으로 사라지기만 한다. 사진은 main이 data URL로 바꿔서 넘긴다.
+  const data =JSON.parse(new URLSearchParams(location.search).get('d') || '{}');
   const card = document.getElementById('card');
   document.getElementById('name').textContent = data.title || 'Instagram';
   document.getElementById('body').textContent = data.body || '';
