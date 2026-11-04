@@ -168,11 +168,12 @@ ipcRenderer.on('watcher:check', () => scheduleCheck('unread', 500));
 
 /* ================= 2순위: 화면 목록 읽기 ================= */
 
-const notifiedRows = new Set(); // 읽지 않은 상태로 이미 알린 대화 (이름)
+const notifiedRows = new Map(); // 대화 이름 → 마지막으로 알린 종류 ('typing' | 'msg')
 let domSeeded = false;
 let lastCount = 0;
 
 const MINE = /^(나|회원님|You)\s*:/; // 내가 보낸 메시지
+const TYPING = /입력\s*중|typing/i; // 상대가 입력 중일 때 미리보기 자리에 뜨는 문구
 const TIME_SUFFIX = /\s*[·•]\s*[^·•]{1,8}$/; // " · 1분" 같은 시간 표시
 
 function rowCandidates() {
@@ -228,13 +229,16 @@ function scanDom() {
   }
   if (!rows.length) return;
 
-  // 대화마다 읽지 않은 동안 한 번만 알린다. 미리보기 글자는 "1분 → 2분"처럼 계속 바뀌어서 기준으로 쓰지 않는다.
+  // 입력 중 → 'typing', 읽지 않은 메시지 → 'msg'로 대화마다 상태를 두고, 상태가 바뀔 때만 알린다.
+  // 그래서 "입력 중" 팝업 뒤 실제 메시지가 오면 메시지 팝업이 다시 뜬다(같은 tag라 팝업은 교체됨).
+  // 미리보기 글자는 "1분 → 2분"처럼 계속 바뀌어서 기준으로 쓰지 않는다.
   // 읽음(굵은 글씨 아님)으로 바뀌면 다음 새 메시지 때 다시 알릴 수 있게 지운다.
   const fresh = [];
   for (const r of rows) {
-    if (!r.unread || MINE.test(r.preview)) notifiedRows.delete(r.name);
-    else if (!notifiedRows.has(r.name)) {
-      notifiedRows.add(r.name);
+    const kind = TYPING.test(r.preview) ? 'typing' : r.unread && !MINE.test(r.preview) ? 'msg' : '';
+    if (!kind) notifiedRows.delete(r.name);
+    else if (notifiedRows.get(r.name) !== kind) {
+      notifiedRows.set(r.name, kind);
       fresh.push(r);
     }
   }
