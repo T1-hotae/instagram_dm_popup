@@ -12,6 +12,8 @@
 ![Electron](https://img.shields.io/badge/Electron-33-47848F?logo=electron&logoColor=white)
 ![version](https://img.shields.io/badge/version-1.0.4-E1306C)
 
+### [⬇️ Windows 설치 파일 받기](https://github.com/T1-hotae/instagram_dm_popup/releases/latest)
+
 </div>
 
 ---
@@ -38,7 +40,8 @@ InstaDM은 **메신저처럼 항상 켜 두는 DM 창**입니다. 공식 Instagr
 
 ### 설치 파일로
 
-1. `npm run dist`로 만든 `dist/InstaDM-Setup-1.0.4.exe`를 실행합니다.
+1. [Releases 최신 버전](https://github.com/T1-hotae/instagram_dm_popup/releases/latest)에서 `InstaDM-Setup-x.y.z.exe`를 받아 실행합니다. (직접 만들려면 `npm run dist` → `dist/`)
+   - 서명되지 않은 앱이라 "Windows의 PC 보호" 창이 뜨면 **추가 정보 → 실행**을 누릅니다.
 2. 설치 위치를 고르고 설치하면 바탕화면과 시작 메뉴에 **InstaDM** 바로가기가 생깁니다.
 3. 처음 실행하면 창에서 Instagram에 로그인합니다. 끝입니다.
 
