@@ -3,6 +3,7 @@
 //   메인 창  = titlebar/(타이틀바) + instagram/(그 아래 Instagram 화면, igView)
 //   감시 창  = watcher/ (숨은 받은편지함, 새 DM 감지)
 //   팝업     = popup/   (오른쪽 아래 알림)
+//   채팅 창  = chat/    (대화 하나만 띄운 창, 대화마다 하나)
 // 전체 그림은 docs/[00] 구조.md, 쓰인 기술과 원리는 docs/[03] 기술과 원리.md에 있다.
 const {
   app, BrowserWindow, WebContentsView, Tray, Menu, ipcMain, screen, shell, nativeImage, nativeTheme, session, dialog, powerMonitor,
@@ -30,7 +31,7 @@ if (!app.requestSingleInstanceLock()) {
 /* ---------------- 설정 ---------------- */
 
 const settingsPath = () => path.join(app.getPath('userData'), 'settings.json');
-const defaults = { notify: true, sound: true, preview: true };
+const defaults = { notify: true, sound: true, preview: true, chatWindow: true };
 let settings = { ...defaults };
 
 function loadSettings() {
@@ -210,20 +211,32 @@ function createMainWindow() {
       avatarClickAt = 0;
       if (wc.navigationHistory.canGoBack()) wc.navigationHistory.goBack();
     }
+    // 대화를 열면 채팅 창으로 넘기고 메인 창은 받은편지함으로 되돌린다
+    if (settings.chatWindow && openChat(url)) {
+      if (wc.navigationHistory.canGoBack()) wc.navigationHistory.goBack();
+      else wc.loadURL(INBOX_URL);
+    }
     syncTheme();
   };
   wc.on('did-navigate', onMainNavigate);
   wc.on('did-navigate-in-page', onMainNavigate);
   wc.on('did-finish-load', syncTheme);
 
-  // 새 창 요청: 페이스북·Meta 로그인은 앱 안 작은 창에서 (같은 세션이라 로그인이 반영됨),
-  // Instagram 안의 링크는 메인 창에서, 외부 링크는 기본 브라우저로
+  guardLinks(wc, mainWindow, (url) => wc.loadURL(url));
+  bindKeys(wc, () => mainWindow.close()); // Ctrl+W: X 버튼과 같이 트레이로 숨김
+
+  setInterval(() => mainWindow.isVisible() && syncTheme(), 5000);
+}
+
+// 새 창 요청: 페이스북·Meta 로그인은 앱 안 작은 창에서 (같은 세션이라 로그인이 반영됨),
+// Instagram 안의 링크는 openInstagram으로, 외부 링크는 기본 브라우저로
+function guardLinks(wc, parent, openInstagram) {
   wc.setWindowOpenHandler(({ url }) => {
     if (isMetaLogin(url)) {
       return {
         action: 'allow',
         overrideBrowserWindowOptions: {
-          parent: mainWindow,
+          parent,
           width: 520,
           height: 720,
           autoHideMenuBar: true,
@@ -232,7 +245,7 @@ function createMainWindow() {
         },
       };
     }
-    if (isInstagram(url)) wc.loadURL(url);
+    if (isInstagram(url)) openInstagram(url);
     else if (/^https?:/.test(url)) shell.openExternal(url);
     return { action: 'deny' };
   });
@@ -243,27 +256,26 @@ function createMainWindow() {
       if (/^https?:/.test(url)) shell.openExternal(url);
     }
   });
+}
 
-  // 메뉴바가 없어서 단축키를 직접 처리
+// 메뉴바가 없어서 단축키를 직접 처리. close = Ctrl+W 때 할 일
+function bindKeys(wc, close) {
   wc.on('before-input-event', (e, input) => {
     if (input.type !== 'keyDown' || !input.control) return;
     const key = input.key.toLowerCase();
     if (key === 'r') wc.reload();
-    else if (key === 'w') mainWindow.close(); // X 버튼과 같이 트레이로 숨김
-    else if (key === '=' || key === '+') zoom(0.5);
-    else if (key === '-') zoom(-0.5);
-    else if (key === '0') zoom(0);
+    else if (key === 'w') close();
+    else if (key === '=' || key === '+') zoom(0.5, wc);
+    else if (key === '-') zoom(-0.5, wc);
+    else if (key === '0') zoom(0, wc);
     else if (key === 'i' && input.shift) wc.openDevTools({ mode: 'detach' });
     else return;
     e.preventDefault();
   });
-
-  setInterval(() => mainWindow.isVisible() && syncTheme(), 5000);
 }
 
-function zoom(step) {
-  if (!igView) return;
-  const wc = igView.webContents;
+function zoom(step, wc = igView && igView.webContents) {
+  if (!wc) return;
   wc.setZoomLevel(step ? wc.getZoomLevel() + step : 0);
 }
 
@@ -419,6 +431,116 @@ function showMain(url) {
   igView.webContents.focus();
 }
 
+/* ---------------- 채팅 창 (대화 하나만, 카카오톡 대화창처럼) ---------------- */
+
+// 창마다 Instagram 페이지가 통째로 떠서(약 200MB) 개수를 제한한다. 넘치면 가장 먼저 연 창을 닫는다.
+const MAX_CHATS = 4;
+const chatWindows = new Map(); // thread id → 창
+
+function threadIdOf(url) {
+  try {
+    const m = /^\/direct\/t\/([^/]+)/.exec(new URL(url).pathname);
+    return m ? m[1] : '';
+  } catch {
+    return '';
+  }
+}
+
+const isChatContents = (wc) => [...chatWindows.values()].some((w) => !w.isDestroyed() && w.webContents === wc);
+
+// 대화 주소면 채팅 창을 열고(이미 있으면 앞으로) true, 아니면 false
+function openChat(url) {
+  let id = threadIdOf(url);
+  if (!id) return false;
+  const open = chatWindows.get(id);
+  if (open && !open.isDestroyed()) {
+    if (open.isMinimized()) open.restore();
+    open.show();
+    open.focus();
+    return true;
+  }
+  while (chatWindows.size >= MAX_CHATS) {
+    const [oldId, w] = chatWindows.entries().next().value;
+    chatWindows.delete(oldId);
+    if (!w.isDestroyed()) w.destroy();
+  }
+
+  const win = new BrowserWindow({
+    width: 420,
+    height: 680,
+    minWidth: 320,
+    minHeight: 400,
+    title: 'InstaDM',
+    icon: path.join(ASSETS, 'icon.png'),
+    show: false,
+    backgroundColor: nativeTheme.shouldUseDarkColors ? '#000000' : '#ffffff',
+    webPreferences: {
+      partition: 'persist:instagram',
+      preload: path.join(__dirname, 'chat', 'preload.js'),
+      contextIsolation: true,
+      sandbox: true,
+      nodeIntegration: false,
+      spellcheck: false,
+    },
+  });
+  chatWindows.set(id, win);
+  win.on('closed', () => { if (chatWindows.get(id) === win) chatWindows.delete(id); });
+  log('채팅 창 열기', { open: chatWindows.size });
+
+  const wc = win.webContents;
+  wc.loadURL(`https://www.instagram.com/direct/t/${id}/`);
+  win.once('ready-to-show', () => {
+    win.show();
+    wc.focus();
+  });
+
+  // 포커스가 없으면 페이지에 숨겨진 것으로 알려 읽음 처리를 막는다 (chat/preload.js)
+  const setActive = () => !wc.isDestroyed() && wc.send('chat:active', win.isFocused());
+  win.on('focus', setActive);
+  win.on('blur', setActive);
+  wc.on('did-finish-load', setActive); // 새로고침하면 preload가 처음 상태(보임)로 돌아가므로 다시 알린다
+
+  // 이 대화 밖으로 나가는 이동(프로필 등)은 메인 창에서 열고 채팅 창은 대화에 남긴다.
+  // 받은편지함으로 가는 것(모바일 화면의 ← 버튼)은 창 닫기로 본다.
+  const onNavigate = (_e, navUrl) => {
+    const p = new URL(navUrl).pathname;
+    const tid = threadIdOf(navUrl);
+    if (tid) {
+      // Instagram이 주소의 id를 바꿔 쓰는 경우도 같은 창으로 찾을 수 있게 다시 등록
+      if (tid !== id && !chatWindows.has(tid)) {
+        if (chatWindows.get(id) === win) chatWindows.delete(id);
+        id = tid;
+        chatWindows.set(id, win);
+      }
+      return;
+    }
+    if (p.startsWith('/accounts/') || p.startsWith('/challenge')) return;
+    if (p.startsWith('/direct/inbox')) {
+      win.close();
+      return;
+    }
+    showMain(navUrl);
+    if (wc.navigationHistory.canGoBack()) wc.navigationHistory.goBack();
+    else win.close();
+  };
+  wc.on('did-navigate', onNavigate);
+  wc.on('did-navigate-in-page', onNavigate);
+  wc.on('render-process-gone', (_e, d) => {
+    log('채팅 렌더러 종료', d.reason, d.exitCode);
+    if (!win.isDestroyed()) win.destroy();
+  });
+
+  guardLinks(wc, win, (u) => (openChat(u) ? null : showMain(u)));
+  bindKeys(wc, () => win.close());
+  return true;
+}
+
+// 채팅 창에서 Esc (대화 상자가 없을 때)
+ipcMain.on('chat:close', (e) => {
+  const win = BrowserWindow.fromWebContents(e.sender);
+  if (win && isChatContents(e.sender)) win.close();
+});
+
 /* ---------------- 우측 하단 팝업 알림 ---------------- */
 
 const POPUP_W = 360;
@@ -482,6 +604,9 @@ function showPopup(data) {
   if (!settings.notify) return log('팝업 생략', { reason: 'off' });
   // 창을 보고 있는 중이면 팝업을 띄우지 않는다
   if (mainWindow && mainWindow.isVisible() && mainWindow.isFocused()) return log('팝업 생략', { reason: 'focus' });
+  // 그 대화의 채팅 창을 보고 있어도 띄우지 않는다 (화면 읽기 알림은 주소가 없을 수 있어 그때는 띄움)
+  const chat = [...chatWindows.entries()].find(([, w]) => !w.isDestroyed() && w.isFocused());
+  if (chat && `${data.tag} ${data.url}`.includes(chat[0])) return log('팝업 생략', { reason: 'chat-focus' });
 
   if (same) {
     if (kind === 'typing') {
@@ -563,8 +688,9 @@ ipcMain.on('popup:click', (e) => {
     if (p.data.id && igView) {
       // 페이지가 등록한 알림 onclick을 실행 → Instagram이 해당 대화로 이동
       igView.webContents.send('dm:click', p.data.id);
+      // 채팅 창 설정이 켜져 있으면 메인 창의 대화 이동을 onMainNavigate가 채팅 창으로 넘긴다
       showMain();
-    } else {
+    } else if (!(settings.chatWindow && openChat(p.data.url))) {
       showMain(p.data.url || INBOX_URL);
     }
   }
@@ -691,6 +817,7 @@ function menuTemplate() {
     { label: '알림 받기', type: 'checkbox', checked: settings.notify, click: toggle('notify') },
     { label: '알림 소리', type: 'checkbox', checked: settings.sound, click: toggle('sound') },
     { label: '메시지 미리보기', type: 'checkbox', checked: settings.preview, click: toggle('preview') },
+    { label: '대화를 새 창에서 열기', type: 'checkbox', checked: settings.chatWindow, click: toggle('chatWindow') },
     {
       label: 'Windows 시작 시 실행',
       type: 'checkbox',
@@ -782,11 +909,11 @@ app.whenReady().then(() => {
 
   // Instagram 웹이 알림 권한을 받을 수 있게 허용
   const ses = session.fromPartition('persist:instagram');
-  ses.setPermissionRequestHandler((_wc, permission, cb) => {
-    cb(['notifications', 'clipboard-sanitized-write', 'media'].includes(permission));
-  });
-  ses.setPermissionCheckHandler((_wc, permission) =>
-    ['notifications', 'clipboard-sanitized-write', 'media'].includes(permission));
+  // 채팅 창은 Notification을 가로채지 않으므로 알림 권한을 주지 않는다 (주면 Windows 알림이 따로 뜸)
+  const allowed = (wc, permission) => ['notifications', 'clipboard-sanitized-write', 'media'].includes(permission)
+    && !(permission === 'notifications' && wc && isChatContents(wc));
+  ses.setPermissionRequestHandler((wc, permission, cb) => cb(allowed(wc, permission)));
+  ses.setPermissionCheckHandler((wc, permission) => allowed(wc, permission));
 
   createMainWindow();
   createWatcherWindow();
